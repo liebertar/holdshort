@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # One command for recording the demo. Stops any running stack, brings up a clean one (seed 7),
-# restarts the round from the top and opens the staged screen (map.html?demo=1). Same result on
+# restarts the round from the top and opens the staged screen (the map, with ?demo=1). Same result on
 # every run — whatever holds the ports it needs is stopped first.
 # Stop with Ctrl-C (as with dev.sh). dev.sh picks the model by itself: the Ollama fleet if it
 # answers, else rules.
@@ -77,7 +77,7 @@ answers() { curl -sf --max-time 2 "$1" >/dev/null 2>&1; }
 wait_ready() {
   local waited=0 agents=0
   until answers "http://$LOOPBACK:$SIM_PORT/health" && answers "http://$LOOPBACK:$RT_PORT/state" \
-        && answers "http://$LOOPBACK:$UI_PORT/map.html"; do
+        && answers "http://$LOOPBACK:$UI_PORT/"; do
     [ "$waited" -ge $((READY_S * 2)) ] && return 1
     sleep 0.5; waited=$((waited + 1))
   done
@@ -109,7 +109,7 @@ fi
 curl -sf --max-time 5 -X POST "http://$LOOPBACK:$SIM_PORT/reset" >/dev/null
 QUERY="demo=1"
 [ "$RT_PORT$SIM_PORT" = "80008100" ] || QUERY="$QUERY&rt=$RT_PORT&sim=$SIM_PORT"
-URL="http://$LOOPBACK:$UI_PORT/map.html?$QUERY"
+URL="http://$LOOPBACK:$UI_PORT/?$QUERY"
 echo "  demo    round reset to tick 0 (seed 7)"
 echo "  demo    $URL"
 if [ "${DEMO_OPEN:-1}" = "1" ] && [ "$(uname)" = "Darwin" ]; then open "$URL"; fi

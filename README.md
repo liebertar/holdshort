@@ -2,7 +2,7 @@
 
 **Agents propose. The runtime clears. Only cleared flights move.**
 
-[한국어](README.kr.md)
+[한국어](README.kr.md) · [中文](README.cn.md) · [Español](README.es.md)
 
 - Clearance runtime for AI-operated drone fleets.
 - Drone agents (Nemotron or rules) only file requests. The runtime judges, logs and commands.

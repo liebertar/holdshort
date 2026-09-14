@@ -88,7 +88,7 @@ echo
 print_stack_table
 UI_QUERY=""
 [ "$RT_PORT$SIM_PORT" = "80008100" ] || UI_QUERY="?rt=$RT_PORT&sim=$SIM_PORT"
-echo "  screen  http://$LOOPBACK:$UI_PORT/map.html$UI_QUERY   (not localhost: it tries ::1 first, where Docker may hold the same port)"
+echo "  screen  http://$LOOPBACK:$UI_PORT$UI_QUERY   (not localhost: it tries ::1 first, where Docker may hold the same port)"
 echo "  state   http://$LOOPBACK:$RT_PORT/state   world http://$LOOPBACK:$SIM_PORT/compare"
 echo
 wait

@@ -1563,7 +1563,8 @@ const dictionaries = () => {
   return vm.runInNewContext(`(${html.match(/const TEXT = (\{[\s\S]*?\n\});/)[1]})`);
 };
 
-// From the header card to the inbox. serve.py sends the root paths (/ and /index.html) to map.html.
+// From the header card to the approval page. serve.py serves the map AT the root, so the address
+// stays http://localhost:3100 — no redirect, no "/map.html" to type.
 test('the map header links to the manual approval screen, and that screen links back', () => {
   const html = mapHtml();
   assert.match(html, /<a href="approvals\.html" data-t="approvals"><\/a>/, 'the link on the header card');
@@ -1576,6 +1577,7 @@ test('the map header links to the manual approval screen, and that screen links 
   const serve = readFileSync(new URL('../frontend/serve.py', import.meta.url), 'utf8');
   assert.match(serve, /ROOT_PATHS = \{"\/", "\/index\.html"\}/);
   assert.match(serve, /MAP_PAGE = "\/map\.html"/);
+  assert.doesNotMatch(serve, /send_response\(30\d\)/, 'the root is served, not redirected');
 });
 
 // The label is two lines: the name, and under it in small type what it is.

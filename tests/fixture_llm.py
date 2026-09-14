@@ -6,12 +6,16 @@ which question the reply belongs to. Matching is by tier and needle, so a small 
 prompt wording does not orphan a fixture, and a fixture never answers a question it was
 not recorded for — then the caller gets None and the rules take over, exactly as when the
 server is down.
+
+A recording keeps the wording of the day it was made, so the `brief` and `note` fields still
+quote the Korean building names the runtime wrote back then. Only `needle` and `text` matter to
+the replay, and both are English; leave the rest alone rather than edit a record after the fact.
 """
 
 import json
 import pathlib
 
-from holdshort.llm.client import LlmReply, LlmTier, TieredLlm
+from shared.llm.client import LlmReply, LlmTier, TieredLlm
 
 FIXTURE_DIR = pathlib.Path(__file__).resolve().parent / "fixtures" / "llm"
 
@@ -28,7 +32,7 @@ def load_fixtures(folder: pathlib.Path = FIXTURE_DIR) -> list[dict]:
 
 
 class FixtureLlm(TieredLlm):
-    """티어와 바늘(needle)로 녹음된 답을 돌려줍니다. 맞는 것이 없으면 None — 규칙 차례입니다."""
+    """Recorded replies, matched by tier and needle. No match returns None: the rules answer."""
 
     def __init__(self, records: list[dict] | None = None, model: str = "nemotron-3-nano",
                  tiers: tuple[str, ...] = ("nano", "super", "ultra")):
@@ -36,8 +40,8 @@ class FixtureLlm(TieredLlm):
                          models={tier: model for tier in tiers}, timeout_s=0.0,
                          request_extra={}, record_dir="")
         self.records = load_fixtures() if records is None else list(records)
-        self.asked: list[tuple[str, str]] = []     # (tier, user) — 무엇을 물었는지 시험이 봅니다
-        self.served: list[str] = []                # 어느 fixture 가 답했는지
+        self.asked: list[tuple[str, str]] = []     # (tier, user): what was asked, for the tests
+        self.served: list[str] = []                # which fixture answered
 
     def ask(self, tier: LlmTier, system: str, user: str, max_tokens: int = 400,
             json_object: bool = False, timeout_s: float | None = None) -> LlmReply | None:

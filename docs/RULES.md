@@ -1,8 +1,8 @@
 # Rules the runtime enforces
 
 Every number here is enforced by code. Nothing in this table is decided by a model. Constants live in
-`holdshort/core/geo.py`, `holdshort/core/route.py`, `holdshort/runtime/intents.py`,
-`holdshort/runtime/briefing.py`, `holdshort/core/intake.py` and `configs/fleet.yaml`.
+`shared/geo.py`, `shared/route.py`, `backend/runtime/intents.py`,
+`backend/intake/briefing.py`, `shared/intake.py` and `configs/fleet.yaml`.
 
 ## Airspace
 
@@ -41,7 +41,7 @@ Every number here is enforced by code. Nothing in this table is decided by a mod
 |---|---|
 | NOTAM the grammar can read (FAA-style bounded area, altitude band, Zulu window) | applied at the tick it is due: cleared routes through it are recalled and leave by the nearest exit, new routes refused |
 | Airworthiness directive for a type | every `fly_route` of that type refused until the directive ends |
-| Prose the grammar cannot read | the Super model structures it; code validates; a person confirms in the inbox before it applies |
+| Prose the grammar cannot read | the Super model structures it; code validates; a person confirms on the approval page before it applies |
 | Weather: wind > 10 m/s, gust > 12 m/s or visibility < 1,500 m | fleet-wide takeoff hold at once (trusted sources), airborne aircraft continue and land; lifted by a person or expiry |
 | Incident at a building (fire, collapse, police) | forbidden circle, default 150 m (50–500 m accepted), all altitudes; routes through it recalled; landing areas inside unusable |
 | Briefing: crane, park closure, event, flight restriction | from an official domain and read by the grammar: applied at once. From any other domain, or read by a model (Tavily research's structured answers included): held for a person. Windows are capped at 6,000 ticks |

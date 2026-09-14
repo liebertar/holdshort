@@ -18,7 +18,7 @@
     "results": [
      {
       "title": "St. Nicholas Park : NYC Parks - Alerts",
-      "url": "https://www.nycgovparks.org/parks/st-nicholas-park/alerts#holdshort-fixture",
+      "url": "https://www.nycgovparks.org/parks/st-nicholas-park/alerts#skynet-fixture",
       "score": 0.82,
       "content": "St. Nicholas Park will be closed to the public on Tuesday morning for storm damage repairs."
      }
@@ -30,7 +30,7 @@
    "response": {
     "results": [
      {
-      "url": "https://www.nycgovparks.org/parks/st-nicholas-park/alerts#holdshort-fixture",
+      "url": "https://www.nycgovparks.org/parks/st-nicholas-park/alerts#skynet-fixture",
       "raw_content": "NYC Parks - St. Nicholas Park service alert (fixture). Closure: St. Nicholas Park will be closed to the public on Tuesday, September 22, 2026 from 5:00 a.m. to 12:00 p.m. while crews repair storm damage to the upper terrace and the paths between West 130th Street and West 141st Street. Please use alternate routes."
      }
     ]

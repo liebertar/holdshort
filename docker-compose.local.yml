@@ -1,0 +1,144 @@
+# The whole stack on a laptop: simulator, runtime, map and four drone agents.
+#   cp .env.local.example .env.local
+#   docker compose -f docker-compose.local.yml --env-file .env.local up --build
+#   → map http://localhost:3100 · manual approval http://localhost:3100/approvals.html
+#
+# The drone agents are not on the world network, so they have no way to reach an autopilot; only the
+# runtime is on both. The direct wiring for the scoreboard is an overlay: drone/docker-compose.direct.yml.
+
+# Stack name: containers, networks and volumes group under sky-net, whatever the folder is called.
+name: sky-net
+
+x-drone: &drone
+  build:
+    context: .
+    dockerfile: drone/Dockerfile
+    target: guarded
+  env_file:
+    - path: .env.local
+      required: false
+  restart: unless-stopped
+  extra_hosts: ["host.docker.internal:host-gateway"]
+
+# Models. Empty means rules only. NEBIUS_API_KEY alone fills in the Token Factory URL, and the model
+# ids default to the nvidia/... values below (the same contract as scripts/dev.sh). To use the Mac's
+# Ollama from the containers, point at host.docker.internal (the runtime's server :11439, drones
+# LLM_URL_1..4 = :11435..:11438) and give MODEL_NANO and MODEL_SUPER too: the defaults are Nebius
+# ids that Ollama does not know, so the rules would answer (compose block in .env.local.example).
+# The runtime calls Super and Ultra (notices, advisories, arbitration). Drones use Nano, and Super for
+# a high-urgency form (drone/agent/propose.py).
+x-llm: &llm
+  LLM_BASE_URL: ${LLM_BASE_URL:-${NEBIUS_API_KEY:+https://api.tokenfactory.nebius.com/v1}}
+  NEBIUS_API_KEY: ${NEBIUS_API_KEY:-}
+  MODEL_NANO: ${MODEL_NANO:-nvidia/Nemotron-3_5-Lightning}
+  MODEL_SUPER: ${MODEL_SUPER:-nvidia/nemotron-3-super-120b-a12b}
+  # MODEL_ULTRA= (empty) turns arbitration off: '-' without a colon lets an empty value win. A local
+  # Ollama has no Ultra; left unset, it asks for a Nebius id that isn't there and the rules answer.
+  MODEL_ULTRA: ${MODEL_ULTRA-nvidia/Nemotron-3-Ultra-550b-a55b}
+  LLM_REQUEST_EXTRA: ${LLM_REQUEST_EXTRA:-}
+  LLM_TIMEOUT_S: ${LLM_TIMEOUT_S:-6}
+  LLM_RECORD_DIR: ${LLM_RECORD_DIR:-}
+
+# Shared by the drone agents. For one server per drone (local fleet: scripts/ollama_fleet.sh,
+# 11435..11438) give LLM_URL_1..4; otherwise they all share LLM_BASE_URL. The host's Ollama is
+# http://host.docker.internal:1143x/v1.
+x-agent-llm: &agent-llm
+  NEBIUS_API_KEY: ${NEBIUS_API_KEY:-}
+  MODEL_NANO: ${MODEL_NANO:-nvidia/Nemotron-3_5-Lightning}
+  MODEL_SUPER: ${MODEL_SUPER:-nvidia/nemotron-3-super-120b-a12b}
+  LLM_REQUEST_EXTRA: ${LLM_REQUEST_EXTRA:-}
+  LLM_TIMEOUT_S: ${LLM_TIMEOUT_S:-6}
+  LLM_RECORD_DIR: ${LLM_RECORD_DIR:-}
+
+services:
+  sim:
+    build:
+      context: .
+      dockerfile: sim/Dockerfile
+    environment:
+      PORT: 8100
+      SEED: ${SEED:-7}
+      FLEET_LIMIT_USD: 720
+      TICK_SECONDS: ${TICK_SECONDS:-0.2}
+      # Dispatch (sim/dispatch.py). Empty: rule dispatch. DISPATCH=cuopt with CUOPT_URL (a cuOpt
+      # server on a GPU) lets cuOpt plan; anything off and the rules decide that stop. The sim image
+      # has no configs/fleet.yaml, so under compose only these variables pick the dispatcher.
+      DISPATCH: ${DISPATCH:-}
+      CUOPT_URL: ${CUOPT_URL:-}
+      CUOPT_TIMEOUT_S: ${CUOPT_TIMEOUT_S:-}
+      CUOPT_TIME_LIMIT_S: ${CUOPT_TIME_LIMIT_S:-}
+      CUOPT_BACKOFF_S: ${CUOPT_BACKOFF_S:-}
+    ports: ["8100:8100"]
+    networks: [world]
+
+  runtime:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    environment:
+      <<: *llm
+      PORT: 8000
+      CONFIG: /app/configs/fleet.yaml
+      SIM_URL: http://sim:8100
+      LEDGER_PATH: /data/ledger.jsonl
+      ARBITRATION_WINDOW_S: ${ARBITRATION_WINDOW_S:-1.5}
+      # Intake. Its record lives on the ledger's volume, so a restart does not re-read search results.
+      INTAKE_DB: /data/intake.sqlite
+      TAVILY_API_KEY: ${TAVILY_API_KEY:-}
+      INTAKE_PERIOD_S: ${INTAKE_PERIOD_S:-300}
+      # METAR from aviationweather.gov, no key. METAR=off turns it off. Stations: configs/fleet.yaml.
+      METAR: ${METAR:-on}
+      METAR_STATIONS: ${METAR_STATIONS:-}
+      METAR_PERIOD_S: ${METAR_PERIOD_S:-300}
+    ports: ["8000:8000"]
+    volumes: [ledger:/data]
+    # Model servers on the host (Ollama, mlx-lm) are host.docker.internal: built into Docker
+    # Desktop, and this line makes it work on Linux.
+    extra_hosts: ["host.docker.internal:host-gateway"]
+    # The only service on both networks.
+    networks: [fleet, world]
+    depends_on: [sim]
+
+  ui:
+    build:
+      context: .
+      dockerfile: frontend/Dockerfile
+    ports: ["3100:3000"]
+    networks: [fleet]
+    depends_on: [runtime]
+
+  # --- drone agents: they file with the runtime and nothing else ---------------
+  drone-01:
+    <<: *drone
+    environment: { <<: *agent-llm, LLM_BASE_URL: "${LLM_URL_1:-${LLM_BASE_URL:-${NEBIUS_API_KEY:+https://api.tokenfactory.nebius.com/v1}}}",
+                   ASSET_ID: drone-01, RUNTIME_URL: "http://runtime:8000" }
+    networks: [fleet]
+    depends_on: [runtime]
+
+  drone-02:
+    <<: *drone
+    environment: { <<: *agent-llm, LLM_BASE_URL: "${LLM_URL_2:-${LLM_BASE_URL:-${NEBIUS_API_KEY:+https://api.tokenfactory.nebius.com/v1}}}",
+                   ASSET_ID: drone-02, RUNTIME_URL: "http://runtime:8000" }
+    networks: [fleet]
+    depends_on: [runtime]
+
+  drone-03:
+    <<: *drone
+    environment: { <<: *agent-llm, LLM_BASE_URL: "${LLM_URL_3:-${LLM_BASE_URL:-${NEBIUS_API_KEY:+https://api.tokenfactory.nebius.com/v1}}}",
+                   ASSET_ID: drone-03, RUNTIME_URL: "http://runtime:8000" }
+    networks: [fleet]
+    depends_on: [runtime]
+
+  drone-04:
+    <<: *drone
+    environment: { <<: *agent-llm, LLM_BASE_URL: "${LLM_URL_4:-${LLM_BASE_URL:-${NEBIUS_API_KEY:+https://api.tokenfactory.nebius.com/v1}}}",
+                   ASSET_ID: drone-04, RUNTIME_URL: "http://runtime:8000" }
+    networks: [fleet]
+    depends_on: [runtime]
+
+networks:
+  fleet: {}
+  world: {}
+
+volumes:
+  ledger: {}

@@ -18,8 +18,16 @@ import time
 import unittest
 from unittest import mock
 
-from holdshort.agent.planner import OperatorPlanner
-from holdshort.core.intake import (
+from backend.intake.briefing import (
+    CLOSED_CEILING_M,
+    RECORDED_PREFIX,
+    cell_of,
+    domain_of,
+    trusted_domain,
+)
+from backend.runtime.tower import Runtime
+from drone.agent.planner import OperatorPlanner
+from shared.intake import (
     Gazetteer,
     UnknownPlace,
     eastern_offset_hours,
@@ -28,8 +36,8 @@ from holdshort.core.intake import (
     read_hazard,
     read_window,
 )
-from holdshort.core.models import Proposal
-from holdshort.core.tavily import (
+from shared.models import Proposal
+from shared.tavily import (
     BudgetExhausted,
     CreditBook,
     IntakePoller,
@@ -38,24 +46,15 @@ from holdshort.core.tavily import (
     TavilyClient,
     load_tavily_fixtures,
 )
-from holdshort.runtime.briefing import (
-    CLOSED_CEILING_M,
-    RECORDED_PREFIX,
-    cell_of,
-    domain_of,
-    trusted_domain,
-)
-from holdshort.runtime.service import Runtime
 from sim import world as sim_world
 from tests.fixture_llm import FixtureLlm
 
 CONFIG = "configs/fleet.yaml"
-DAY = datetime.date(2026, 9, 22)          # 녹음이 녹음된 날(fixture 의 as_of)
+DAY = datetime.date(2026, 9, 22)          # the day the recordings were made (fixture as_of)
 BBOX = (40.669, -74.037, 40.836, -73.917)
 DEPOT = (40.7019, -73.9700)
 ST_NICHOLAS = (40.8155, -73.949)
-UNION_SQUARE = (40.7359, -73.99063)
-CRANE_AT = (40.799327, -73.968752)        # 지명 사전의 2701 Broadway
+CRANE_AT = (40.799327, -73.968752)        # 2701 Broadway in the gazetteer
 TAVILY_ENV = ("TAVILY_API_KEY", "TAVILY_RECORDED", "TAVILY_BUDGET_PER_ROUND",
               "TAVILY_RECORD_DIR", "TAVILY_FIXTURE_DIR", "BRIEFING_DATE", "TAVILY_URL")
 FIXTURES = "tests/fixtures/tavily"
@@ -88,7 +87,7 @@ class RecordingAdapter:
 
 
 def fleet(**extra) -> dict:
-    """땅에 선 두 대. 첫 배달지는 씨앗 7 과 같은 센트럴파크 북쪽·모닝사이드."""
+    """Two grounded aircraft. First drop-offs match seed 7: north Central Park, Morningside."""
     return {
         "drone-01": {"lat": DEPOT[0], "lon": DEPOT[1], "alt_m": 0.0,
                      "job_lat": 40.7985, "job_lon": -73.955},
@@ -146,7 +145,8 @@ def pending(runtime, action="publish_notice"):
 
 
 class QuietEnv(unittest.TestCase):
-    """개발자 셸의 키가 시험에 새지 않게. 시험마다 Tavily 환경을 비우고 필요한 것만 넣습니다."""
+    """Keeps the developer shell's keys out of the tests. Each test clears the Tavily environment
+    and sets only what it needs."""
 
     env: dict = {}
 
@@ -159,10 +159,11 @@ class QuietEnv(unittest.TestCase):
         os.environ.update(self.env)
 
 
-# ---------- 가짜 Tavily(살아 있는 API 의 대역) ----------
+# ---------- Fake Tavily (stand-in for the live API) ----------
 
 class FakeTavilyApi(http.server.BaseHTTPRequestHandler):
-    """/search /extract /map /crawl /research 와 GET /research/<id>. 답은 클래스 속성으로."""
+    """/search /extract /map /crawl /research and GET /research/<id>. Answers live in class
+    attributes."""
 
     status = 200
     delay_s = 0.0
@@ -267,7 +268,7 @@ class FakeServerCase(QuietEnv):
                 if seen[0].endswith(suffix) and not seen[0].startswith("/research/")]
 
 
-# ---------- 클라이언트 ----------
+# ---------- Client ----------
 
 class ClientTest(FakeServerCase):
     def test_each_endpoint_sends_its_shape_and_books_what_it_cost(self):
@@ -284,7 +285,7 @@ class ClientTest(FakeServerCase):
         client.crawl_site("https://tfr.faa.gov/", instructions="New York TFRs", limit=6)
         answer = client.research("hazards", {"type": "object", "properties": {}}, poll_s=0.01)
         self.assertEqual(answer["status"], "completed")
-        # map 은 요금을 안 실어 왔습니다 — 10쪽당 1 로 셈합니다(12쪽 → 2).
+        # map returned no usage — it is counted at 1 per 10 pages (12 pages → 2).
         self.assertEqual(client.credits.used, 1 + 1 + 2 + 3 + 16)
         estimated = [call for call in client.credits.calls if call.estimated]
         self.assertEqual([call.op for call in estimated], ["map"])
@@ -297,7 +298,7 @@ class ClientTest(FakeServerCase):
         research = self.posts("/research")[0][1]
         self.assertEqual((research["model"], research["stream"]), ("mini", False))
         self.assertIn("output_schema", research)
-        self.assertEqual(FakeTavilyApi.polls, 2, "끝날 때까지 GET /research/<id> 로 물었습니다")
+        self.assertEqual(FakeTavilyApi.polls, 2, "polled GET /research/<id> until it finished")
 
     def test_an_empty_wallet_stops_the_call_before_it_leaves_the_process(self):
         FakeTavilyApi.usage = {"search": 1}
@@ -306,16 +307,17 @@ class ClientTest(FakeServerCase):
             client.search_raw(f"q{n}")
         with self.assertRaises(BudgetExhausted):
             client.search_raw("q3")
-        self.assertEqual(len(self.posts("/search")), 3, "한도를 넘는 질문은 나가지 않았습니다")
+        self.assertEqual(len(self.posts("/search")), 3, "no query went out past the cap")
         self.assertEqual((client.credits.used, client.credits.blocked), (3.0, 1))
         client.credits.new_round()
         client.search_raw("q4")
-        self.assertEqual(len(self.posts("/search")), 4, "새 판에는 다시 찹니다")
+        self.assertEqual(len(self.posts("/search")), 4, "a new round refills it")
 
     def test_two_threads_sharing_one_wallet_cannot_overspend_it(self):
-        """브리핑과 검색 폴러는 장부 하나를 나눠 씁니다. 보기만 하고 값은 답이 온 뒤에 적으면 둘이
-        같은 남은 몫을 보고 같이 나갔습니다(한도 3 에 네 번, 4 크레딧). 나가기 전에 몫을
-        잡습니다."""
+        """The briefing and the search poller share one credit book. Checking the balance and
+        booking the cost only once the answer came back let both see the same remaining share and
+        go out together (four calls on a cap of 3, 4 credits). The share is reserved before a
+        call goes out."""
         FakeTavilyApi.usage = {"search": 1}
         FakeTavilyApi.delay_s = 0.3
         client = self.client(budget=3)
@@ -332,7 +334,7 @@ class ClientTest(FakeServerCase):
             thread.start()
         for thread in threads:
             thread.join(10)
-        self.assertEqual(len(self.posts("/search")), 3, "한도를 넘는 질문은 나가지 않았습니다")
+        self.assertEqual(len(self.posts("/search")), 3, "no query went out past the cap")
         self.assertEqual((client.credits.used, client.credits.pending, client.credits.blocked),
                          (3.0, 0.0, 3))
 
@@ -355,7 +357,7 @@ class ClientTest(FakeServerCase):
             self.assertEqual(len(files), 1)
             with open(os.path.join(folder, files[0]), encoding="utf-8") as handle:
                 saved = handle.read()
-            self.assertNotIn("tvly-test", saved, "키는 기록에 남지 않습니다")
+            self.assertNotIn("tvly-test", saved, "the key is not written to the recording")
             replay = RecordedTavily(folder)
             body = replay.search_raw("tower crane permit near Broadway Manhattan")
             self.assertEqual([r["url"] for r in body["results"]], ["https://www.nyc.gov/c"])
@@ -373,7 +375,7 @@ class ClientTest(FakeServerCase):
         self.assertEqual(self.posts("/search"), [])
 
 
-# ---------- 문법 ----------
+# ---------- Grammar ----------
 
 class GrammarTest(unittest.TestCase):
     def setUp(self):
@@ -398,13 +400,13 @@ class GrammarTest(unittest.TestCase):
         closure = self.read("nycparks-st-nicholas-closure.json")
         self.assertEqual((closure.kind, closure.landing_area), ("closure", "la-stnicholas"))
         self.assertEqual((closure.window.start.hour, closure.window.end.hour), (9, 16),
-                         "05:00~12:00 EDT 는 09:00~16:00Z 입니다")
+                         "05:00~12:00 EDT is 09:00~16:00Z")
         rally = self.read("news-union-square-rally.json", op="search")
         self.assertEqual((rally.kind, rally.place, rally.radius_m),
                          ("event", "Union Square", 300.0))
         advisory = self.read("nws-wind-advisory.json")
         self.assertEqual(advisory.kind, "weather")
-        self.assertIsNone(advisory.rule_kind, "기상 주의보는 규칙이 아니라 정보입니다")
+        self.assertIsNone(advisory.rule_kind, "a weather advisory is information, not a rule")
         self.assertAlmostEqual(advisory.numbers["gust_mps"], 45 * 0.44704, places=1)
 
     def test_irrelevant_pages_are_read_as_nothing(self):
@@ -414,24 +416,24 @@ class GrammarTest(unittest.TestCase):
     def test_code_refuses_numbers_places_and_windows_that_do_not_add_up(self):
         low = read_hazard("A tower crane at 2701 Broadway will reach a height of 5 feet. "
                           "September 22, 2026.", self.gazetteer, self.areas, DAY)
-        self.assertIn("크레인 높이가 10~400 m 밖", hazard_problems(low, BBOX))
+        self.assertIn("crane height outside 10~400 m", hazard_problems(low, BBOX))
         tall = read_hazard("A tower crane at 2701 Broadway will reach a height of 1500 feet.",
                            self.gazetteer, self.areas, DAY)
         self.assertTrue(hazard_problems(tall, BBOX))
         nowhere = read_hazard("A tower crane at 99999 Imaginary Street rises 200 feet tall.",
                               self.gazetteer, self.areas, DAY)
-        self.assertIsNone(nowhere, "지명 사전에 없는 주소는 자리가 아닙니다")
+        self.assertIsNone(nowhere, "an address missing from the gazetteer is not a place")
         not_ours = read_hazard("Central Park will be closed on September 22, 2026 from 5 a.m. "
                                "to 9 a.m.", self.gazetteer, self.areas, DAY)
-        self.assertIsNone(not_ours, "우리 착륙장이 아닌 공원의 폐쇄는 규칙이 아닙니다")
+        self.assertIsNone(not_ours, "closing a park that is not our landing site is not a rule")
         wide = read_hazard("Parade at Union Square Park within 9000 meters radius of the "
                            "stage, September 22 from 5 a.m. to 7 a.m.", self.gazetteer,
                            self.areas, DAY)
-        self.assertEqual(wide.radius_m, 300.0, "범위 밖 반경은 버리고 기본 반경을 씁니다")
+        self.assertEqual(wide.radius_m, 300.0, "an out-of-range radius falls back to the default")
         far = read_hazard("Temporary flight restriction: Radius: 1 nautical miles. Latitude: "
                           "41.2000, Longitude: -73.9000. September 22, 2026 at 0900 UTC to "
                           "September 22, 2026 at 1100 UTC", self.gazetteer, self.areas, DAY)
-        self.assertIn("서비스 영역 밖 자리", hazard_problems(far, BBOX))
+        self.assertIn("a place outside the service area", hazard_problems(far, BBOX))
 
     def test_new_york_time_follows_daylight_saving(self):
         self.assertEqual(eastern_offset_hours(DAY), -4)
@@ -456,7 +458,7 @@ class GrammarTest(unittest.TestCase):
                          ("la-tompkins", 9))
 
 
-# ---------- 신뢰 ----------
+# ---------- Trust ----------
 
 class TrustTest(QuietEnv):
     def test_trust_is_by_the_exact_domain_or_below_it(self):
@@ -483,7 +485,7 @@ class TrustTest(QuietEnv):
                          ("tfr.faa.gov", "www.nycgovparks.org", "eastvillage-bulletin.example"))
         self.assertEqual({kinds[k]["trust"] for k in ("restriction", "closure")}, {"official"})
         self.assertEqual(kinds["event"]["trust"], "unofficial")
-        # 공식 쪽의 규칙은 공역에 들어갔고, 비공식 쪽의 행사는 카드로만 서 있습니다.
+        # The official rules went into the airspace; the unofficial event stands only as a card.
         self.assertIsNotNone(runtime.airspace.get(kinds["restriction"]["id"]))
         self.assertIsNotNone(runtime.airspace.get(kinds["closure"]["id"]))
         self.assertIsNone(runtime.airspace.get(kinds["event"]["id"]))
@@ -491,8 +493,8 @@ class TrustTest(QuietEnv):
         self.assertEqual([card["params"]["notice_id"] for card in cards], [kinds["event"]["id"]])
         self.assertEqual(cards[0]["params"]["notice"]["citation"]["domain"],
                          "eastvillage-bulletin.example")
-        self.assertIn("공식 출처가 아닙니다", runtime._decisions[cards[0]["id"]].reason)
-        self.assertEqual(runtime.snapshot()["briefing"]["ignored"], 2, "무관한 두 글")
+        self.assertIn("is not an official source", runtime._decisions[cards[0]["id"]].reason)
+        self.assertEqual(runtime.snapshot()["briefing"]["ignored"], 2, "the two irrelevant pages")
 
     def test_every_rule_carries_its_source_into_the_ledger_the_store_and_the_state(self):
         runtime, _ = briefed_runtime()
@@ -533,11 +535,11 @@ class TrustTest(QuietEnv):
         item = items_by_kind(runtime)["closure"]
         self.assertEqual((item["status"], item["trust"], item["read_by"]),
                          ("held", "official", "model:nemotron-3-nano"))
-        self.assertIsNone(runtime.airspace.get(item["id"]), "모델은 아무것도 걸지 못합니다")
+        self.assertIsNone(runtime.airspace.get(item["id"]), "the model puts nothing in force")
         self.assertEqual(len(pending(runtime)), 1)
 
 
-# ---------- 규칙이 판정에서 하는 일 ----------
+# ---------- What the rules do in judgement ----------
 
 class RuleTest(FakeServerCase):
     def crane_runtime(self):
@@ -559,9 +561,9 @@ class RuleTest(FakeServerCase):
         self.assertEqual((volume.ceiling_m, volume.clearance_m), (round(230 * 0.3048, 3), 50.0))
         west, east = (CRANE_AT[0], CRANE_AT[1] - 0.008), (CRANE_AT[0], CRANE_AT[1] + 0.008)
         through = route("drone-09", [west, east], alt_m=100.0)
-        self.assertIn("구간이 규정을 어깁니다", runtime.check_route(through))
+        self.assertIn("breaks the rules", runtime.check_route(through))
         self.assertEqual(through.params["blocked_volume"], crane["id"])
-        above = route("drone-09", [west, east], alt_m=121.0)   # 옥상 70 m + 이격 50 m 위
+        above = route("drone-09", [west, east], alt_m=121.0)   # above 70 m rooftop + 50 m margin
         self.assertIsNone(runtime.check_route(above))
 
     def test_a_closed_park_refuses_landing_but_not_takeoff_or_overflight(self):
@@ -571,15 +573,16 @@ class RuleTest(FakeServerCase):
         volume = runtime.airspace.get(closure["id"])
         self.assertEqual((volume.floor_m, volume.ceiling_m), (0.0, CLOSED_CEILING_M))
         landing = route("drone-09", [(40.80, -73.96), ST_NICHOLAS], alt_m=60.0)
-        self.assertIn("내려앉을 수 없습니다", runtime.check_route(landing))
+        self.assertIn("cannot touch down", runtime.check_route(landing))
         self.assertEqual(landing.params["blocked_kind"], "landing")
         takeoff = route("drone-09", [ST_NICHOLAS, (40.80, -73.96)], alt_m=60.0)
-        self.assertIsNone(runtime.check_route(takeoff), "닫힌 공원에서 떠나는 것은 막지 않습니다")
+        self.assertIsNone(runtime.check_route(takeoff), "leaving a closed park is not blocked")
         over = route("drone-09", [(40.825, -73.945), (40.805, -73.953)], alt_m=80.0)
-        self.assertIsNone(runtime.check_route(over), "위로 지나는 것도 막지 않습니다")
+        self.assertIsNone(runtime.check_route(over), "nor is flying over it")
 
     def test_the_operator_planner_declines_a_closed_park_without_any_change(self):
-        """기체 쪽 계획기는 /airspace 의 volumes 를 그대로 싣고, 목적지에 착륙 검사를 겁니다."""
+        """The aircraft-side planner loads the /airspace volumes as they are and applies the
+        landing check to the destination."""
         runtime, _ = briefed_runtime()
         runtime.absorb([])
         planner = OperatorPlanner()
@@ -604,18 +607,18 @@ class RuleTest(FakeServerCase):
                                "route": [{"lat": 40.7420, "lon": -73.9850, "alt_m": 80.0}]}}
         runtime, adapter = briefed_runtime(telemetry=fleet(**flying), tick=2300)
         runtime.absorb([])
-        self.assertEqual(adapter.sent, [], "사람이 보기 전에는 아무것도 안 막습니다")
+        self.assertEqual(adapter.sent, [], "nothing is blocked before a person has looked")
         card = pending(runtime)[0]
-        runtime.approve(card["id"], "관제사", allow=True)
+        runtime.approve(card["id"], "controller", allow=True)
         self.assertIn(("drone-02", "divert_ground"), [(a, action) for a, action, _ in adapter.sent])
         runtime.absorb([])
         event = items_by_kind(runtime)["event"]
         self.assertEqual(event["status"], "approved")
         refused = route("drone-09", [(40.7300, -73.9950), (40.7420, -73.9850)], alt_m=80.0)
-        self.assertIn("구간이 규정을 어깁니다", runtime.check_route(refused))
+        self.assertIn("breaks the rules", runtime.check_route(refused))
 
 
-# ---------- 녹음과 살아 있는 답 ----------
+# ---------- Recorded and live answers ----------
 
 class SourceTest(FakeServerCase):
     def test_without_a_key_the_briefing_runs_recorded_and_says_so_everywhere(self):
@@ -655,7 +658,7 @@ class SourceTest(FakeServerCase):
         state = runtime.snapshot()["briefing"]
         self.assertEqual(state["source"], "recorded")
         self.assertIn("HTTP 401", state["fallback"]["why"])
-        self.assertTrue(state["items"], "녹음이 장면을 이어 받았습니다")
+        self.assertTrue(state["items"], "the recording took over the scene")
         self.assertTrue(all(item["recorded"] for item in state["items"]))
         for _ in range(2):
             runtime.briefing.request_run()
@@ -663,7 +666,7 @@ class SourceTest(FakeServerCase):
             runtime.absorb([])
         failed = [e for e in ledger_lines(runtime) if e["decision"]["code"] ==
                   "intake_source_failed"]
-        self.assertEqual(len(failed), 1, "실패는 바뀔 때 한 줄")
+        self.assertEqual(len(failed), 1, "one line per failure, when it changes")
         self.assertEqual(failed[0]["decision"]["detail"]["source"], "briefing")
         FakeTavilyApi.status = 200
         runtime.briefing.request_run()
@@ -689,7 +692,7 @@ class SourceTest(FakeServerCase):
         self.assertEqual(codes(runtime), [])
 
 
-# ---------- 예산 ----------
+# ---------- Budget ----------
 
 class BudgetTest(FakeServerCase):
     def test_the_briefing_never_spends_past_the_round_budget(self):
@@ -703,17 +706,17 @@ class BudgetTest(FakeServerCase):
         state = runtime.snapshot()["briefing"]
         self.assertLessEqual(state["credits_used"], state["budget"])
         self.assertEqual(state["budget"], 5.0)
-        self.assertGreater(client.credits.blocked, 0, "나머지 호출은 안 나갔습니다")
+        self.assertGreater(client.credits.blocked, 0, "the remaining calls were not sent")
         paid = [call for call in client.credits.calls if call.ok and call.op != "research"]
-        self.assertEqual(len(self.posts()), len(paid), "나간 호출 = 적힌 호출")
-        self.assertEqual(self.posts("/research"), [], "research 는 예산이 없어 시작도 안 했습니다")
-        # 다음 판에는 다시 찹니다.
+        self.assertEqual(len(self.posts()), len(paid), "calls sent = calls booked")
+        self.assertEqual(self.posts("/research"), [], "research never started for lack of budget")
+        # The next round refills it.
         runtime._round = 2
         runtime.absorb([])
         self.assertGreater(len(self.posts()), len(paid))
 
 
-# ---------- 재시작 ----------
+# ---------- Restart ----------
 
 class RestartTest(QuietEnv):
     def setUp(self):
@@ -730,12 +733,12 @@ class RestartTest(QuietEnv):
         second.absorb([])
         asked = second.briefing.recorded_client().asked
         self.assertEqual([what for op, what in asked if op == "extract"], [],
-                         "읽은 쪽의 본문을 다시 받지 않았습니다")
+                         "pages already read were not fetched again")
         self.assertEqual([c for c in codes(second) if c == "briefing_item"], [],
-                         "다시 읽지 않았습니다")
+                         "nothing was read again")
         for kind in ("restriction", "closure"):
             self.assertIsNotNone(second.airspace.get(before[kind]),
-                                 f"{kind} 규칙은 재시작을 넘어 그대로 걸렸습니다")
+                                 f"the {kind} rule stayed in force across the restart")
 
     def test_a_waiting_card_comes_back_once_and_not_after_a_person_answers_it(self):
         first, _ = briefed_runtime(db=self.db)
@@ -746,18 +749,19 @@ class RestartTest(QuietEnv):
         second.absorb([])
         cards = pending(second)
         self.assertEqual([c["params"]["notice_id"] for c in cards], [event_id],
-                         "카드를 잃지 않았고, 하나만 다시 올랐습니다")
-        second.approve(cards[0]["id"], "관제사", allow=True)
+                         "no card was lost, and only one came back")
+        second.approve(cards[0]["id"], "controller", allow=True)
         second.absorb([])
         self.assertEqual(items_by_kind(second)["event"]["status"], "approved")
         third, _ = briefed_runtime(db=self.db, tick=2300)
         third.absorb([])
-        self.assertEqual(pending(third), [], "사람이 답한 카드는 다시 오르지 않습니다")
+        self.assertEqual(pending(third), [], "a card a person answered does not come back")
         self.assertEqual(items_by_kind(third)["event"]["status"], "approved")
-        self.assertIsNotNone(third.airspace.get(event_id), "사람이 확인한 규칙은 그대로 겁니다")
+        self.assertIsNotNone(third.airspace.get(event_id),
+                             "a rule a person confirmed stays in force")
 
 
-# ---------- 세계 스레드 ----------
+# ---------- World thread ----------
 
 class WorldThreadTest(FakeServerCase):
     def test_the_world_thread_never_waits_for_tavily(self):
@@ -776,7 +780,7 @@ class WorldThreadTest(FakeServerCase):
             runtime.absorb([])
             slowest = max(slowest, time.monotonic() - started)
             time.sleep(0.02)
-        self.assertLess(slowest, 0.2, f"absorb 가 Tavily 를 기다렸습니다 ({slowest:.2f}s)")
+        self.assertLess(slowest, 0.2, f"absorb waited on Tavily ({slowest:.2f}s)")
         deadline = time.monotonic() + 10.0
         while runtime.snapshot()["briefing"]["runs"] == 0 and time.monotonic() < deadline:
             runtime.tick += 1
@@ -787,7 +791,7 @@ class WorldThreadTest(FakeServerCase):
         self.assertEqual(len(self.posts("/search")), 2)
 
 
-# ---------- 회랑 ----------
+# ---------- Corridor ----------
 
 class CorridorTest(QuietEnv):
     def test_a_cleared_corridor_asks_about_new_neighbourhoods_once_per_round(self):
@@ -795,7 +799,8 @@ class CorridorTest(QuietEnv):
         telemetry = fleet(**{"drone-05": {"lat": start[0], "lon": start[1], "alt_m": 0.0}})
         runtime, _ = briefed_runtime(telemetry=telemetry)
         runtime.absorb([])
-        self.assertNotIn("crane", items_by_kind(runtime), "판 시작에는 그 동네를 안 물었습니다")
+        self.assertNotIn("crane", items_by_kind(runtime),
+                         "that neighbourhood was not asked about at the start of the round")
         corridor = [start, CRANE_AT, (40.8090, -73.9630)]
         decision = runtime.file(route("drone-05", corridor, alt_m=121.0).to_dict())
         self.assertEqual(decision.verdict.value, "auto", decision.reason)
@@ -809,17 +814,17 @@ class CorridorTest(QuietEnv):
                 if e["decision"]["code"] == "briefing_run"]
         self.assertEqual(runs[0], "round")
         self.assertIn("corridor", runs)
-        # 같은 칸을 지나는 회랑은 이 판에 다시 묻지 않습니다.
+        # A corridor through the same cells is not asked about again this round.
         runtime.briefing.corridor_cleared([{"lat": p[0], "lon": p[1]} for p in corridor])
         self.assertEqual(runtime.briefing.pending_cells, {})
-        # 판이 바뀌면 동네를 다시 묻습니다.
+        # A new round asks about the neighbourhood again.
         runtime._round = 2
         runtime.absorb([])
         runtime.briefing.corridor_cleared([{"lat": p[0], "lon": p[1]} for p in corridor])
         self.assertIn(cell_of(*CRANE_AT, 1.0), runtime.briefing.pending_cells)
 
 
-# ---------- 화면 ----------
+# ---------- Screen ----------
 
 class StateTest(QuietEnv):
     def test_state_briefing_has_the_documented_shape_and_post_run_queues_one(self):
@@ -868,11 +873,12 @@ class FixtureShapeTest(unittest.TestCase):
                 self.assertIsInstance(call["response"].get("results"), list)
 
 
-# ---------- 하네스: 브리핑을 켜도 런타임 쪽은 전부 0 ----------
+# ---------- Harness: the guarded wiring stays all zero with the briefing on ----------
 
 class HarnessWithBriefingTest(unittest.TestCase):
-    """씨앗 7 한 판(앞 3200틱)을 녹음 브리핑을 켠 채로. 규칙은 조이기만 하니 위반은 0 이어야
-    합니다. 직결 세계는 런타임을 모르므로 이 시험이 건드리지 않습니다."""
+    """One seed-7 round (first 3200 ticks) with the recorded briefing on. Rules only tighten, so
+    violations must be 0. The direct wiring does not know the runtime, so this test leaves it
+    alone."""
 
     TICKS = 3200
 
@@ -910,7 +916,7 @@ class HarnessWithBriefingTest(unittest.TestCase):
                     "separation_losses", "site_conflicts", "pad_conflicts", "unrecorded_actions",
                     "incident_incursions", "weather_hold_takeoffs", "post_recall_violations"):
             self.assertEqual(self.guarded[key], 0, key)
-        self.assertGreater(self.guarded["deliveries"], 0, "기단은 여전히 배달합니다")
+        self.assertGreater(self.guarded["deliveries"], 0, "the fleet still delivers")
 
     def test_the_briefing_ran_and_its_rules_were_in_the_judge(self):
         with open(self.ledger_path, encoding="utf-8") as handle:
@@ -922,7 +928,7 @@ class HarnessWithBriefingTest(unittest.TestCase):
         runs = [e["decision"]["detail"]["trigger"] for e in done
                 if e["decision"]["code"] == "briefing_run"]
         self.assertEqual(runs[0], "round")
-        self.assertIn("corridor", runs, "승인한 회랑이 새 동네를 물었습니다")
+        self.assertIn("corridor", runs, "an approved corridor asked about a new neighbourhood")
         state = self.runtimes[0].snapshot()["briefing"]
         self.assertEqual(state["source"], "recorded")
 

@@ -1,5 +1,5 @@
 [project]
-name = "holdshort"
+name = "sky-net"
 version = "0.1.0"
 description = "Agents propose. Only the runtime commits."
 requires-python = ">=3.11"
@@ -7,10 +7,10 @@ license = { text = "Apache-2.0" }
 dependencies = ["pyyaml>=6.0"]
 
 [project.scripts]
-holdshort = "holdshort.runtime.service:main"
+sky-net = "backend.api.server:main"
 
 [tool.setuptools.packages.find]
-include = ["holdshort*"]
+include = ["backend*", "drone*", "shared*", "sim*"]
 
 [tool.ruff]
 line-length = 100

@@ -49,7 +49,7 @@ class LoadingTest(unittest.TestCase):
             self.assertIn((round(vehicle.x, 6), round(vehicle.y, 6)),
                           {(round(x, 6), round(y, 6)) for x, y in seats})
         self.assertEqual(len({(v.x, v.y) for v in world.vehicles.values()}), len(world.vehicles),
-                         "두 대가 같은 자리에 있습니다")
+                         "two aircraft are on the same seat")
 
     def test_boxes_stack_one_at_a_time_and_the_aircraft_waits_loaded(self):
         world = _fleet_world()
@@ -60,7 +60,7 @@ class LoadingTest(unittest.TestCase):
             seen.append(vehicle.load)
         self.assertEqual(sorted(set(seen)), list(range(0, PARCELS_PER_TRIP + 1)))
         self.assertEqual(vehicle.load, PARCELS_PER_TRIP)
-        self.assertEqual(vehicle.state, "ready", "다 실었으면 승인을 기다립니다")
+        self.assertEqual(vehicle.state, "ready", "fully loaded, it waits for clearance")
         self.assertEqual(vehicle.alt, 0.0)
 
     def test_an_approval_during_loading_waits_for_the_boxes_and_the_clearance(self):
@@ -70,7 +70,7 @@ class LoadingTest(unittest.TestCase):
                            {"legs": _legs_to(world, vehicle, vehicle.job_x, vehicle.job_y)},
                            "l_1", "schedule", None, 1)
         self.assertTrue(result["ok"])
-        self.assertEqual(vehicle.state, "loading", "싣는 중에 승인이 와도 뜨지 않습니다")
+        self.assertEqual(vehicle.state, "loading", "an approval mid-load does not launch it")
         _run(world, LOAD_TICKS)
         self.assertEqual(vehicle.load, PARCELS_PER_TRIP)
         self.assertIn(vehicle.state, ("ready", "delivering"))
@@ -81,7 +81,7 @@ class LoadingTest(unittest.TestCase):
 
 class UnloadingTest(unittest.TestCase):
     def _land_at_job(self, world, vehicle):
-        """배달지 위에 놓고 내려앉히는 지름길. 비행 자체는 다른 시험이 봅니다."""
+        """Shortcut: place it above the drop-off and land it. Other tests cover the flight."""
         vehicle.x, vehicle.y = vehicle.job_x, vehicle.job_y
         vehicle.alt = 0.5
         vehicle.state = "landing"
@@ -95,14 +95,14 @@ class UnloadingTest(unittest.TestCase):
         self._land_at_job(world, vehicle)
         self.assertEqual(vehicle.state, "dropping")
         self.assertNotEqual(vehicle.job_label, first_stop,
-                            "내리는 동안 다음 배달지를 알아야 합니다")
+                            "while unloading it must already know the next drop-off")
         seen = []
         for tick in range(2, DROP_TICKS + 3):
             world.tick(tick)
             seen.append(vehicle.load)
         self.assertEqual(min(seen), PARCELS_PER_TRIP - PARCELS_PER_STOP)
-        self.assertEqual(len(set(seen)), PARCELS_PER_STOP + 1, "상자는 하나씩 사라져야 합니다")
-        self.assertEqual(vehicle.state, "picking", "내린 자리에서 돌아갈 상자를 받습니다")
+        self.assertEqual(len(set(seen)), PARCELS_PER_STOP + 1, "parcels come off one at a time")
+        self.assertEqual(vehicle.state, "picking", "it picks up return parcels where it unloaded")
         picked = []
         for tick in range(DROP_TICKS + 3, DROP_TICKS + 3 + PICKUP_PER_STOP * BOX_TICKS + 1):
             world.tick(tick)
@@ -115,7 +115,7 @@ class UnloadingTest(unittest.TestCase):
     def test_after_the_last_stop_the_next_leg_is_the_warehouse_seat(self):
         world = _fleet_world()
         vehicle = world.vehicles["drone-02"]
-        vehicle.stops_left = 1               # 마지막 정차
+        vehicle.stops_left = 1               # last stop
         self._land_at_job(world, vehicle)
         self.assertEqual(vehicle.job_label, "Warehouse")
         self.assertEqual((round(vehicle.job_x, 3), round(vehicle.job_y, 3)),
@@ -130,7 +130,7 @@ class UnloadingTest(unittest.TestCase):
         vehicle.x, vehicle.y = vehicle.job_x, vehicle.job_y
         vehicle.state, vehicle.alt = "landing", 0.5
         world.tick(1)
-        self.assertEqual(vehicle.state, "dropping", "가져온 상자를 내립니다")
+        self.assertEqual(vehicle.state, "dropping", "it unloads the parcels it brought back")
         _run(world, PICKUP_PER_STOP * 2 * BOX_TICKS + 1, 2)
         self.assertEqual(vehicle.load, 0)
         self.assertEqual(vehicle.state, "ready")
@@ -156,7 +156,7 @@ class UnloadingTest(unittest.TestCase):
         world._send_home(vehicle)
         world.act("drone-04", "decline_job", {}, "l_3", "none", None, 1)
         self.assertEqual(vehicle.job_label, "Warehouse",
-                         "들를 곳이 없는 기체는 배달 주문을 받지 않습니다")
+                         "an aircraft with no stops left takes no delivery order")
 
 
 class HomeTest(unittest.TestCase):
@@ -171,11 +171,12 @@ class HomeTest(unittest.TestCase):
         self.assertIsNone(vehicle.job_x)
 
     def test_every_landing_area_is_clear_and_reachable_both_ways(self):
-        """착륙장은 건물에서 떨어져 있고, 이륙장에서 오가는 길이 나야 합니다.
+        """Landing sites stand clear of buildings and must be reachable from the pad and back.
 
-        길이 안 나는 착륙장 하나면 거기 간 기체가 영영 '승인 대기'로 서 있습니다.
+        One landing site with no route means an aircraft sent there sits at 'awaiting clearance'
+        forever.
         """
-        from holdshort.core.route import Router
+        from shared.route import Router
 
         router = Router(AIRSPACE)
         seat = to_latlon(*seat_of(0))
@@ -183,9 +184,9 @@ class HomeTest(unittest.TestCase):
             with self.subTest(area=area["name"]):
                 point = (area["lat"], area["lon"])
                 self.assertIsNone(AIRSPACE.landing_breach(*point),
-                                  "둘레 50m 안에 건물·금지 구역이 있습니다")
-                self.assertIsNotNone(router.plan(seat, point), "이륙장에서 가는 길이 없습니다")
-                self.assertIsNotNone(router.plan(point, seat), "돌아오는 길이 없습니다")
+                                  "a building or forbidden zone lies within 50m")
+                self.assertIsNotNone(router.plan(seat, point), "no route out from the pad")
+                self.assertIsNotNone(router.plan(point, seat), "no route back")
 
     def test_depart_from_the_seat_takes_a_new_order_and_tops_up_the_boxes(self):
         world = _fleet_world()
@@ -194,19 +195,19 @@ class HomeTest(unittest.TestCase):
         vehicle.job_x = vehicle.job_y = None
         world.act("drone-01", "depart", {}, "l_4", "none", None, 1)
         self.assertEqual(vehicle.state, "loading")
-        self.assertIsNotNone(vehicle.job_x, "싣기만 하고 갈 곳이 없으면 영영 싣기만 합니다")
+        self.assertIsNotNone(vehicle.job_x, "loading with nowhere to go means loading forever")
         self.assertEqual(vehicle.work_ticks, LOAD_TICKS)
         vehicle.load, vehicle.state = 3, "ready"
         world.act("drone-01", "depart", {}, "l_5", "none", None, 2)
         self.assertEqual(vehicle.work_ticks, (PARCELS_PER_TRIP - 3) * BOX_TICKS,
-                         "남은 상자 위에 채웁니다")
+                         "it tops up the parcels already aboard")
 
     def test_the_battery_does_not_drain_on_the_ground_and_never_dies(self):
         world = _fleet_world()
         vehicle = world.vehicles["drone-01"]
         before = vehicle.battery
         _run(world, LOAD_TICKS + 40)
-        self.assertEqual(vehicle.battery, before, "땅에서는 배터리가 안 닳습니다")
+        self.assertEqual(vehicle.battery, before, "the battery does not drain on the ground")
         vehicle.battery = 0.5
         vehicle.state, vehicle.alt = "cruising", 55.0
         _run(world, 5, LOAD_TICKS + 41)

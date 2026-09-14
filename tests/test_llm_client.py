@@ -11,8 +11,8 @@ import tempfile
 import unittest
 from unittest import mock
 
-from holdshort.llm import client as client_module
-from holdshort.llm.client import (
+from shared.llm import client as client_module
+from shared.llm.client import (
     LlmTier,
     TieredLlm,
     host_of,
@@ -55,7 +55,7 @@ class ReplyParsingTest(unittest.TestCase):
     def test_json_only_inside_think_is_not_an_answer(self):
         self.assertEqual(strip_think('<think>{"legs": []}</think>'), "")
         self.assertIsNone(parse_json_object('<think>{"legs": [1]}</think>'))
-        # 닫히지 않은 생각은 전부 생각입니다
+        # An unclosed think block is all thinking
         self.assertIsNone(parse_json_object('<think>maybe {"legs": [1]}'))
         self.assertIsNone(reply_from(completion('<think>{"a": 5}</think>'), "m"))
 
@@ -69,12 +69,12 @@ class ReplyParsingTest(unittest.TestCase):
         self.assertEqual(parse_choice("2", 3), 1)
         self.assertEqual(parse_choice(" #3. ", 3), 2)
         self.assertIsNone(parse_choice("7", 3))
-        self.assertIsNone(parse_choice("7번은 안 되고 2번으로", 3))
+        self.assertIsNone(parse_choice("not 7, go with 2", 3))
         self.assertIsNone(parse_choice("", 3))
 
     def test_host_is_read_off_the_url(self):
         self.assertEqual(host_of("http://localhost:11434/v1"), "ollama")
-        self.assertEqual(host_of("http://127.0.0.1:11437/v1"), "ollama")     # 함대 서버
+        self.assertEqual(host_of("http://127.0.0.1:11437/v1"), "ollama")     # fleet server
         self.assertEqual(host_of("http://host:114340/v1"), "other")
         self.assertEqual(host_of("https://api.tokenfactory.nebius.com/v1"), "nebius")
         self.assertEqual(host_of("http://llm-edge:8080/v1"), "other")
@@ -82,7 +82,7 @@ class ReplyParsingTest(unittest.TestCase):
 
 
 class RequestShapeTest(unittest.TestCase):
-    """무엇을 보내는지. 서버 흉내는 post_json_status 하나만 바꿔 끼웁니다."""
+    """What gets sent. The fake server swaps out post_json_status and nothing else."""
 
     def _capture(self, llm, responses):
         calls = []
@@ -128,7 +128,7 @@ class RequestShapeTest(unittest.TestCase):
         self.assertEqual(len(calls), 3)
         self.assertIn("response_format", calls[0]["payload"])
         self.assertNotIn("response_format", calls[1]["payload"])
-        self.assertNotIn("response_format", calls[2]["payload"])   # 기억합니다
+        self.assertNotIn("response_format", calls[2]["payload"])   # remembered
 
     def test_a_timeout_is_not_retried(self):
         llm = make()
@@ -140,7 +140,8 @@ class RequestShapeTest(unittest.TestCase):
         self.assertEqual(llm.stats["nano"].ok, 0)
 
     def test_a_call_can_bring_its_own_budget(self):
-        """초안은 신청서보다 긴 질문이라 자기 예산을 들고 옵니다. 없으면 클라이언트 기본값입니다."""
+        """A draft is a longer question than a form, so it brings its own budget. Without
+        one, the client default applies."""
         llm = make()
         calls, patch = self._capture(llm, [(200, completion("1")), (200, completion("2"))])
         with patch:
@@ -156,7 +157,7 @@ class RequestShapeTest(unittest.TestCase):
             llm.ask(LlmTier.NANO, "s", "u")
             self.assertTrue(llm.unreachable_within(60))
             llm.ask(LlmTier.NANO, "s", "u")
-        self.assertFalse(llm.unreachable_within(60))   # 답을 받았으면 잊습니다
+        self.assertFalse(llm.unreachable_within(60))   # forgotten once an answer comes back
 
     def test_stats_count_kept_and_discarded_replies(self):
         llm = make()
@@ -197,8 +198,9 @@ class RequestShapeTest(unittest.TestCase):
             self.assertEqual((second["tier"], second["text"], second["via"]), ("ultra", None, None))
 
     def test_two_threads_can_share_one_client_without_losing_the_books(self):
-        """기체 에이전트는 초안을 작업 스레드에서, 신청서를 본 스레드에서 같은 클라이언트로
-        묻습니다. 장부(ok 횟수)와 기록 파일 번호가 서로를 덮으면 안 됩니다."""
+        """The aircraft agent asks for drafts on a worker thread and for forms on the main
+        thread, through the same client. The books (ok counts) and the record file numbers
+        must not overwrite each other."""
         import threading
         import time
 
@@ -206,7 +208,7 @@ class RequestShapeTest(unittest.TestCase):
             llm = make(record_dir=folder)
 
             def fake(url, payload, timeout=20.0, headers=None):
-                time.sleep(0.0005)          # GIL 을 놓아 진짜로 섞이게 합니다
+                time.sleep(0.0005)          # releases the GIL so the threads really interleave
                 return 200, completion('{"a": 1}')
 
             def work():
@@ -248,50 +250,50 @@ class FixtureLlmTest(unittest.TestCase):
         self.assertEqual(llm.ask(LlmTier.NANO, "s", "origin x -> goal 40.79850,-73.955").text,
                          '{"legs": []}')
         self.assertIsNone(llm.ask(LlmTier.NANO, "s", "goal 40.70000"))
-        self.assertIsNone(llm.ask(LlmTier.SUPER, "s", "goal 40.79850"))   # 티어가 다릅니다
+        self.assertIsNone(llm.ask(LlmTier.SUPER, "s", "goal 40.79850"))   # different tier
         self.assertEqual(llm.ask(LlmTier.ULTRA, "s", "Resource: pad").model, "nemotron-3-nano")
         self.assertEqual(llm.stats["nano"].fallback, 1)
 
 
 class RecordedFormsTest(unittest.TestCase):
-    """녹음된 진짜 Nemotron 답으로 신청서와 중재를 오프라인에서 돌립니다."""
+    """Runs forms and arbitration offline on recorded answers from the real Nemotron."""
 
     def setUp(self):
         from tests.fixture_llm import FixtureLlm, load_fixtures
 
         self.records = [r for r in load_fixtures() if r.get("kind") in ("form", "arbiter")]
         if not self.records:
-            self.skipTest("녹음된 신청서 답이 없습니다")
+            self.skipTest("no recorded form answers")
         self.llm = FixtureLlm(records=self.records)
 
     def test_the_model_writes_a_form_and_signs_it_with_its_id(self):
-        from holdshort.agent.detect import Concern
-        from holdshort.agent.propose import ALLOWED_ACTIONS, Proposer
+        from drone.agent.detect import Concern
+        from drone.agent.propose import ALLOWED_ACTIONS, Proposer
 
         telemetry = {"id": "drone-01", "model": "dv-x500", "state": "ready", "battery": 88.0,
                      "vibration": 0.1, "autonomy_health": 1.0, "passengers": 0, "cargo": 6}
         proposer = Proposer(self.llm)
         written = proposer.write(Concern(kind="needs_route", urgency="normal",
-                                         detail="배달지 Union Square, 배터리 88%"),
+                                         detail="delivering to Union Square, battery 88%"),
                                  telemetry, "pad:launch", frozenset(), ("pad:launch",))
         self.assertEqual(written.author, "nemotron-3-nano")
         self.assertEqual(written.action, "fly_route")
         self.assertIn(written.action, ALLOWED_ACTIONS)
-        # 녹음에 없는 질문은 규칙이 씁니다
-        by_rules = proposer.write(Concern(kind="motor_fault", urgency="high", detail="진동"),
+        # A question missing from the recording is written by the rules
+        by_rules = proposer.write(Concern(kind="motor_fault", urgency="high", detail="vibration"),
                                   telemetry, "pad:launch", frozenset(), ("pad:launch",))
         self.assertEqual(by_rules.author, "rules")
 
     def test_the_arbiter_uses_the_recorded_choice_and_keeps_the_reason(self):
-        from holdshort.core.models import Proposal
-        from holdshort.runtime.arbiter import Arbiter
+        from backend.runtime.arbiter import Arbiter
+        from shared.models import Proposal
 
         def candidate(asset_id, blast, why):
             return Proposal(asset_id=asset_id, action="reserve_pad", cost_usd=28.0,
                             blast_radius=blast, rationale=why, resource="pad:launch")
 
-        candidates = [candidate("drone-01", "schedule", "정비 점검"),
-                      candidate("drone-02", "cargo", "배터리 9%")]
+        candidates = [candidate("drone-01", "schedule", "maintenance check"),
+                      candidate("drone-02", "cargo", "battery 9%")]
         choice = Arbiter(self.llm).pick(candidates, {"drone-01": {"battery": 40.0},
                                                      "drone-02": {"battery": 9.0}})
         self.assertEqual(choice.how, "ultra:nemotron-3-nano")

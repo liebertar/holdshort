@@ -1,0 +1,9 @@
+# Build context is the repository root; each Dockerfile copies only what it names.
+.git
+.venv
+.run
+models
+.env
+.env.*
+**/__pycache__
+**/*.pyc

@@ -1,0 +1,53 @@
+# The direct wiring, the scoreboard's other column: the same four agents driving the autopilot
+# themselves, as most fleets are wired today. Same agent code; they sit on the world network and never
+# file with the runtime. The map does not draw them.
+#
+#   docker compose -f docker-compose.local.yml -f drone/docker-compose.direct.yml --env-file .env.local up --build
+
+x-direct: &direct
+  build:
+    context: .
+    dockerfile: drone/Dockerfile
+    target: direct
+  env_file:
+    - path: .env.local
+      required: false
+  restart: unless-stopped
+  extra_hosts: ["host.docker.internal:host-gateway"]
+  networks: [world]
+  depends_on: [sim]
+
+# Rules unless DIRECT_LLM_URL is given; then the same models as the drone agents.
+x-direct-env: &direct-env
+  NEBIUS_API_KEY: ${NEBIUS_API_KEY:-}
+  MODEL_NANO: ${MODEL_NANO:-nvidia/Nemotron-3_5-Lightning}
+  MODEL_SUPER: ${MODEL_SUPER:-nvidia/nemotron-3-super-120b-a12b}
+  LLM_BASE_URL: ${DIRECT_LLM_URL:-}
+  LLM_REQUEST_EXTRA: ${LLM_REQUEST_EXTRA:-}
+  LLM_TIMEOUT_S: ${LLM_TIMEOUT_S:-6}
+  LLM_RECORD_DIR: ${LLM_RECORD_DIR:-}
+  TRANSPORT: http
+  SIM_URL: http://sim:8100
+
+services:
+  sim:
+    environment:
+      # The direct agents cannot register with the runtime, so the simulator tags each aircraft with
+      # this model id (agent_model). Give it together with DIRECT_LLM_URL.
+      DIRECT_MODEL: ${DIRECT_MODEL:-}
+
+  direct-drone-01:
+    <<: *direct
+    environment: {<<: *direct-env, ASSET_ID: drone-01}
+
+  direct-drone-02:
+    <<: *direct
+    environment: {<<: *direct-env, ASSET_ID: drone-02}
+
+  direct-drone-03:
+    <<: *direct
+    environment: {<<: *direct-env, ASSET_ID: drone-03}
+
+  direct-drone-04:
+    <<: *direct
+    environment: {<<: *direct-env, ASSET_ID: drone-04}

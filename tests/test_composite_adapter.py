@@ -19,9 +19,10 @@ if HAS_PYMAVLINK:
 
 MIRROR = "drone-01"
 OTHER = "drone-02"
-# 세계 스레드가 PX4 를 기다리지 않았다는 기준(초). 런타임의 세계 폴링 주기가 0.25초이고, PX4 를
-# 기다렸다면 단계마다의 응답 시한(여기서 1초)만큼 걸립니다. 50ms 로 두었더니 시험 둘과 스택 셋이
-# 같이 도는 기계에서 흔들렸습니다 — 기다린 것과 바빴던 것은 이 기준으로도 충분히 갈립니다.
+# Threshold (s) for "the world thread did not wait on PX4". The runtime polls the world
+# every 0.25 s, and waiting on PX4 would take the per-step reply timeout (1 s here). At 50 ms
+# this flaked on a machine running two test runs and three stacks at once — waiting and
+# merely being busy still separate cleanly at this threshold.
 NEVER_WAITED_S = 0.2
 LEGS = [{"lat": 40.701803, "lon": -73.970437, "alt_m": 70.0},
         {"lat": 40.710000, "lon": -73.980000, "alt_m": 70.0},
@@ -30,7 +31,8 @@ EXIT = {"lat": 40.705000, "lon": -73.975000}
 
 
 class FakeWorld:
-    """시뮬레이터 자리. 받은 명령을 적고 정해 둔 답을 돌려줍니다. 고도는 시험이 손으로 바꿉니다."""
+    """Stands in for the simulator. Records the commands it gets and returns preset answers.
+    Tests change the altitude by hand."""
 
     def __init__(self, refuse=()):
         self.sent: list[tuple] = []
@@ -49,15 +51,15 @@ class FakeWorld:
             for asset, alt in self.alt_m.items()}}
 
 
-@unittest.skipUnless(HAS_PYMAVLINK, "pymavlink 미설치 (pip install pymavlink)")
+@unittest.skipUnless(HAS_PYMAVLINK, "pymavlink not installed (pip install pymavlink)")
 class CompositeAdapterTest(unittest.TestCase):
     def _composite(self, world=None, wait_link=True, **stub_options):
-        from holdshort.adapters.composite import (
+        from backend.adapters.composite import (
             AutopilotJournal,
             AutopilotMirror,
             CompositeAdapter,
         )
-        from holdshort.adapters.mavlink_fleet import MavlinkFleetAdapter
+        from backend.adapters.mavlink_fleet import MavlinkFleetAdapter
 
         port = next_port()
         stub = AutopilotStub(port, **stub_options).start()
@@ -71,7 +73,7 @@ class CompositeAdapterTest(unittest.TestCase):
             world, AutopilotMirror(MIRROR, autopilot, AutopilotJournal(journal_path)))
         if wait_link:
             self.assertTrue(wait_until(lambda: autopilot.link_up(MIRROR), 8),
-                            "스텁의 하트비트가 오지 않았습니다")
+                            "no heartbeat from the stub")
         return adapter, world, stub, journal_path
 
     def _lift_off(self, adapter, world, alt_m=5.0):
@@ -89,17 +91,17 @@ class CompositeAdapterTest(unittest.TestCase):
         started = time.monotonic()
         result = adapter.execute(MIRROR, "fly_route", {"legs": LEGS}, "l_route")
         spent = time.monotonic() - started
-        self.assertTrue(result["ok"])            # 시뮬의 답이 런타임이 받는 답입니다
+        self.assertTrue(result["ok"])            # the runtime gets the simulator's answer
         self.assertEqual(result["cost_usd"], 12.0)
         self.assertEqual(result["autopilot"]["result"], "queued")
         self.assertIsNone(result["autopilot"]["ok"])
-        self.assertLess(spent, NEVER_WAITED_S, "세계 스레드가 PX4 를 기다렸습니다")
+        self.assertLess(spent, NEVER_WAITED_S, "the world thread waited on PX4")
         self.assertEqual(world.sent, [(MIRROR, "fly_route", "l_route")])
 
     def test_the_cleared_route_becomes_the_same_mission(self):
         adapter, _, stub, _ = self._composite()
         adapter.execute(MIRROR, "fly_route", {"legs": LEGS}, "l_route")
-        self.assertTrue(wait_until(lambda: stub.missions, 8), "임무가 올라오지 않았습니다")
+        self.assertTrue(wait_until(lambda: stub.missions, 8), "no mission was uploaded")
         items = stub.missions[-1]
         self.assertEqual([item.command for item in items],
                          [mavutil.mavlink.MAV_CMD_NAV_TAKEOFF,
@@ -116,7 +118,7 @@ class CompositeAdapterTest(unittest.TestCase):
         adapter.execute(MIRROR, "fly_route", {"legs": LEGS}, "l_route")
         self.assertTrue(wait_until(lambda: stub.missions, 8))
         time.sleep(0.4)
-        self.assertEqual(stub.received, [], "지도의 기체가 아직 땅에 있는데 시동을 걸었습니다")
+        self.assertEqual(stub.received, [], "armed with the map's aircraft still on the ground")
         self.assertEqual(adapter.autopilots()[MIRROR]["pending_start"], "l_route")
 
         self._lift_off(adapter, world)
@@ -136,19 +138,19 @@ class CompositeAdapterTest(unittest.TestCase):
         self.assertTrue(wait_until(
             lambda: mavutil.mavlink.MAV_CMD_MISSION_START in stub.received, 8))
         self.assertEqual(stub.missions[-1][0].command, mavutil.mavlink.MAV_CMD_NAV_WAYPOINT)
-        # 떠 있는 기체에 시동을 다시 걸지 않습니다.
+        # An airborne aircraft is not armed again.
         self.assertNotIn(mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM, stub.received)
 
     def test_a_recall_in_flight_replaces_the_mission_with_the_way_out(self):
         adapter, world, stub, _ = self._composite(airborne=True)
         self._lift_off(adapter, world, alt_m=60.0)
         adapter.execute(MIRROR, "divert_ground", {"exit": EXIT, "volume": "nofly-t"}, "l_recall")
-        self.assertTrue(wait_until(lambda: stub.missions, 8), "회수 임무가 올라오지 않았습니다")
+        self.assertTrue(wait_until(lambda: stub.missions, 8), "no recall mission was uploaded")
         items = stub.missions[-1]
         self.assertEqual([item.command for item in items],
                          [mavutil.mavlink.MAV_CMD_NAV_WAYPOINT, mavutil.mavlink.MAV_CMD_NAV_LAND])
         self.assertEqual(items[0].x, round(EXIT["lat"] * 1e7))
-        # 거울이 회수를 다 마친 뒤에 그 임무가 화면에 섭니다.
+        # The mission shows on the screen once the mirror has finished the recall.
         self.assertTrue(wait_until(lambda: adapter.autopilots()[MIRROR]["mission"], 8))
         mission = adapter.autopilots()[MIRROR]["mission"]
         self.assertEqual(mission["ledger_id"], "l_recall")
@@ -159,10 +161,10 @@ class CompositeAdapterTest(unittest.TestCase):
         adapter.execute(MIRROR, "fly_route", {"legs": LEGS}, "l_route")
         self.assertTrue(wait_until(lambda: stub.missions, 8))
         adapter.execute(MIRROR, "divert_ground", {"hold": "weather"}, "l_recall")
-        self.assertTrue(wait_until(lambda: stub.cleared == 1, 8), "임무를 지우지 않았습니다")
+        self.assertTrue(wait_until(lambda: stub.cleared == 1, 8), "the mission was not cleared")
         self._lift_off(adapter, world)
         time.sleep(0.5)
-        self.assertEqual(stub.received, [], "회수된 경로로 시동이 걸렸습니다")
+        self.assertEqual(stub.received, [], "armed on a recalled route")
         view = adapter.autopilots()[MIRROR]
         self.assertIsNone(view["pending_start"])
         self.assertIsNone(view["mission"])
@@ -180,7 +182,8 @@ class CompositeAdapterTest(unittest.TestCase):
         adapter, world, stub, journal = self._composite(
             refuse_commands=(mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM,))
         result = adapter.execute(MIRROR, "fly_route", {"legs": LEGS}, "l_route")
-        self.assertTrue(result["ok"], "자동조종이 거절해도 기록의 세계의 답은 그대로입니다")
+        self.assertTrue(result["ok"],
+                        "the world of record's answer stands even when the autopilot refuses")
         self._lift_off(adapter, world)
         self.assertTrue(wait_until(
             lambda: any(r["result"] == "start_refused" for r in self._records(journal)), 8))
@@ -198,19 +201,19 @@ class CompositeAdapterTest(unittest.TestCase):
             adapter.execute(MIRROR, "divert_ground", {}, f"l_recall_{index}")
             adapter.telemetry()
             worst = max(worst, time.monotonic() - started)
-        self.assertLess(worst, NEVER_WAITED_S, f"세계 스레드가 {worst:.3f}초 멈췄습니다")
+        self.assertLess(worst, NEVER_WAITED_S, f"the world thread stalled for {worst:.3f}s")
         self.assertTrue(wait_until(
             lambda: any(r["result"] == "upload_failed" for r in self._records(journal)), 15))
         self.assertEqual(stub.received, [])
 
     def test_a_missing_autopilot_is_recorded_and_nothing_else_changes(self):
-        # 아무도 듣지 않는 포트. PX4 컨테이너가 없을 때의 배선입니다.
-        from holdshort.adapters.composite import (
+        # A port nobody listens on: the wiring when there is no PX4 container.
+        from backend.adapters.composite import (
             AutopilotJournal,
             AutopilotMirror,
             CompositeAdapter,
         )
-        from holdshort.adapters.mavlink_fleet import MavlinkFleetAdapter
+        from backend.adapters.mavlink_fleet import MavlinkFleetAdapter
 
         autopilot = MavlinkFleetAdapter({MIRROR: f"udpin:127.0.0.1:{next_port()}"},
                                         ack_timeout_s=1.0, link_timeout_s=1.0)
@@ -260,16 +263,16 @@ class CompositeAdapterTest(unittest.TestCase):
         self.assertTrue(view["mission"]["started"])
         self.assertEqual(len(view["mission"]["items"]), 4)
         self.assertEqual(view["commands"][0]["result"], "started")
-        # 판정에 쓰는 텔레메트리는 그대로 기록의 세계의 것입니다.
+        # The telemetry used for judgement is still the world of record's.
         self.assertEqual(adapter.telemetry()["assets"][MIRROR]["lat"], 40.7018)
 
 
-@unittest.skipUnless(HAS_PYMAVLINK, "pymavlink 미설치 (pip install pymavlink)")
+@unittest.skipUnless(HAS_PYMAVLINK, "pymavlink not installed (pip install pymavlink)")
 class RuntimeWithAMirrorTest(unittest.TestCase):
-    """런타임이 거절하면 조종장치에 아무것도 가지 않습니다. 거울까지 그 보장 안입니다."""
+    """When the runtime refuses, nothing goes to the actuator. The mirror is covered too."""
 
     def _runtime(self, adapter):
-        from holdshort.runtime.service import Runtime
+        from backend.runtime.tower import Runtime
 
         with tempfile.NamedTemporaryFile(suffix=".jsonl", delete=False) as handle:
             runtime = Runtime("configs/fleet.yaml", "http://unused", handle.name, 0.0)
@@ -278,9 +281,9 @@ class RuntimeWithAMirrorTest(unittest.TestCase):
         return runtime
 
     def test_a_refused_filing_never_reaches_the_autopilot(self):
-        from holdshort.adapters.composite import AutopilotMirror, CompositeAdapter
-        from holdshort.adapters.mavlink_fleet import MavlinkFleetAdapter
-        from holdshort.core.models import Proposal, Verdict
+        from backend.adapters.composite import AutopilotMirror, CompositeAdapter
+        from backend.adapters.mavlink_fleet import MavlinkFleetAdapter
+        from shared.models import Proposal, Verdict
 
         port = next_port()
         stub = AutopilotStub(port).start()
@@ -293,20 +296,20 @@ class RuntimeWithAMirrorTest(unittest.TestCase):
         runtime = self._runtime(adapter)
         self.assertTrue(wait_until(lambda: autopilot.link_up(MIRROR), 8))
 
-        # 땅 밑을 지나는 경로. 양식에서 걸립니다 — 판정 이전의 거절입니다.
+        # A route below ground. The form check catches it — a refusal before judgement.
         underground = [{**leg, "alt_m": -1.0} for leg in LEGS]
         refused = runtime.file(Proposal(
             asset_id=MIRROR, action="fly_route", cost_usd=40.0, blast_radius="cargo",
-            rationale="시험", params={"legs": underground}).to_dict())
+            rationale="test", params={"legs": underground}).to_dict())
         self.assertIs(refused.verdict, Verdict.DENIED)
         time.sleep(0.4)
         self.assertEqual(world.sent, [])
-        self.assertEqual(stub.traffic, [], "거절된 신청이 자동조종에 닿았습니다")
+        self.assertEqual(stub.traffic, [], "a refused filing reached the autopilot")
 
-        # 같은 경로를 규정대로 내면 실행되고, 그때 비로소 임무가 올라갑니다.
+        # The same route filed within the rules executes, and only then is the mission uploaded.
         allowed = runtime.file(Proposal(
             asset_id=MIRROR, action="fly_route", cost_usd=40.0, blast_radius="cargo",
-            rationale="시험", params={"legs": LEGS}).to_dict())
+            rationale="test", params={"legs": LEGS}).to_dict())
         self.assertIsNot(allowed.verdict, Verdict.DENIED, allowed.reason)
         self.assertTrue(wait_until(lambda: stub.missions, 8))
         self.assertEqual(runtime.snapshot()["autopilots"][MIRROR]["role"], "mirror")

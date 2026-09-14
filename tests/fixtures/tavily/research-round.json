@@ -25,7 +25,7 @@
        "end": "2026-09-26T04:00",
        "timezone": "UTC",
        "summary": "FAA VIP TFR for UN General Assembly week, 1 NM, surface to 3000 ft.",
-       "source_url": "https://tfr.faa.gov/tfr3/?page=detail_6_0922#holdshort-fixture"
+       "source_url": "https://tfr.faa.gov/tfr3/?page=detail_6_0922#skynet-fixture"
       },
       {
        "kind": "closure",
@@ -34,7 +34,7 @@
        "end": "2026-09-22T12:00",
        "timezone": "local",
        "summary": "NYC Parks closes St. Nicholas Park Tuesday morning for storm repairs.",
-       "source_url": "https://www.nycgovparks.org/parks/st-nicholas-park/alerts#holdshort-fixture"
+       "source_url": "https://www.nycgovparks.org/parks/st-nicholas-park/alerts#skynet-fixture"
       },
       {
        "kind": "event",
@@ -49,18 +49,18 @@
        "kind": "weather",
        "place": "New York City",
        "summary": "Wind advisory Tuesday afternoon, gusts to 45 mph.",
-       "source_url": "https://forecast.weather.gov/showsigwx.php?warnzone=NYZ072#holdshort-fixture"
+       "source_url": "https://forecast.weather.gov/showsigwx.php?warnzone=NYZ072#skynet-fixture"
       }
      ]
     },
     "sources": [
      {
       "title": "FAA TFR",
-      "url": "https://tfr.faa.gov/tfr3/?page=detail_6_0922#holdshort-fixture"
+      "url": "https://tfr.faa.gov/tfr3/?page=detail_6_0922#skynet-fixture"
      },
      {
       "title": "NYC Parks alert",
-      "url": "https://www.nycgovparks.org/parks/st-nicholas-park/alerts#holdshort-fixture"
+      "url": "https://www.nycgovparks.org/parks/st-nicholas-park/alerts#skynet-fixture"
      },
      {
       "title": "East Village Bulletin",
@@ -68,7 +68,7 @@
      },
      {
       "title": "NWS New York",
-      "url": "https://forecast.weather.gov/showsigwx.php?warnzone=NYZ072#holdshort-fixture"
+      "url": "https://forecast.weather.gov/showsigwx.php?warnzone=NYZ072#skynet-fixture"
      }
     ],
     "response_time": 41.2,

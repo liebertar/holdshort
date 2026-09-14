@@ -3,7 +3,7 @@
 
     python3 scripts/px4_check.py                            # udpin:0.0.0.0:14540
     python3 scripts/px4_check.py udpin:0.0.0.0:14540
-    python3 scripts/px4_check.py udpin:0.0.0.0:14540 --fly   # 짧게 한 번 띄웠다 내립니다
+    python3 scripts/px4_check.py udpin:0.0.0.0:14540 --fly   # one short hop up and down
 
 Prints what the autopilot reports, then asks it to land and prints its answer. The answer
 may be a refusal, which is the point: we grant authority, the autopilot still decides
@@ -17,11 +17,11 @@ is the whole command path the demo needs, end to end.
 import sys
 import time
 
-from holdshort.adapters.mavlink_fleet import MavlinkFleetAdapter, route_items
+from backend.adapters.mavlink_fleet import MavlinkFleetAdapter, route_items
 
 ASSET = "vehicle"
 HOP_ALT_M = 20.0
-HOP_NORTH_DEG = 0.0009      # 약 100 m
+HOP_NORTH_DEG = 0.0009      # about 100 m
 FLIGHT_TIMEOUT_S = 180.0
 
 
@@ -45,36 +45,36 @@ def main() -> int:
     fly = "--fly" in arguments
     endpoint = next((a for a in arguments if not a.startswith("--")), "udpin:0.0.0.0:14540")
     adapter = MavlinkFleetAdapter({ASSET: endpoint}, link_timeout_s=30.0)
-    print(f"{endpoint} 에서 하트비트를 기다립니다...")
+    print(f"waiting for a heartbeat on {endpoint}...")
     if not _wait(lambda: adapter.link_up(ASSET), 30.0):
-        print("자동조종이 응답하지 않습니다.")
+        print("the autopilot is not answering.")
         return 1
     _wait(lambda: adapter.autopilot_view(ASSET)["lat"] is not None, 10.0)
     view = adapter.autopilot_view(ASSET)
     _show(view)
 
-    print("\nland 명령을 보냅니다...")
+    print("\nsending land...")
     print("  ->", adapter.execute(ASSET, "land", {}, "l_check"))
 
     if view["lat"] is None:
-        print("위치를 못 받아 임무는 건너뜁니다.")
+        print("no position received; skipping the mission.")
         return 1
     legs = [{"lat": view["lat"], "lon": view["lon"], "alt_m": HOP_ALT_M},
             {"lat": view["lat"] + HOP_NORTH_DEG, "lon": view["lon"], "alt_m": HOP_ALT_M}]
     items = route_items(legs, airborne=adapter.airborne(ASSET))
-    print(f"\n임무 {len(items)}항목을 올립니다 — 승인된 경로가 가는 바로 그 길입니다.")
+    print(f"\nuploading {len(items)} mission items — the same path a cleared route takes.")
     upload = adapter.upload_mission(ASSET, items)
     print("  ->", upload)
     ok = bool(upload["ok"])
 
     if not ok or not fly:
-        print("임무를 지웁니다 (--fly 를 주면 이 임무를 실제로 납니다).")
+        print("clearing the mission (with --fly it is actually flown).")
         print("  ->", adapter.clear_mission(ASSET))
         print("\nPASS" if ok else "\nFAIL")
         return 0 if ok else 1
 
     started = adapter.start_mission(ASSET, arm=not adapter.airborne(ASSET))
-    print("  시동·시작 ->", started)
+    print("  arm + start ->", started)
     ok = ok and bool(started["ok"])
     flew = False
     deadline = time.monotonic() + FLIGHT_TIMEOUT_S
@@ -84,12 +84,12 @@ def main() -> int:
               f" seq={now['mission_seq']} {now['landed']}")
         flew = flew or bool(now["armed"])
         if flew and not now["armed"]:
-            print("  내려서 시동이 꺼졌습니다.")
+            print("  landed and disarmed.")
             break
         time.sleep(2)
     else:
         if ok:
-            print("  시한 안에 못 내렸습니다.")
+            print("  did not land within the time limit.")
             ok = False
     print("\nPASS" if ok else "\nFAIL")
     return 0 if ok else 1

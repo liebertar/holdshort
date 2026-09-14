@@ -18,7 +18,7 @@
     "results": [
      {
       "title": "Wind Advisory - New York (Manhattan) - National Weather Service",
-      "url": "https://forecast.weather.gov/showsigwx.php?warnzone=NYZ072#holdshort-fixture",
+      "url": "https://forecast.weather.gov/showsigwx.php?warnzone=NYZ072#skynet-fixture",
       "score": 0.88,
       "content": "Wind Advisory in effect from 2 PM to 8 PM EDT Tuesday. Gusts up to 45 mph expected."
      }
@@ -30,7 +30,7 @@
    "response": {
     "results": [
      {
-      "url": "https://forecast.weather.gov/showsigwx.php?warnzone=NYZ072#holdshort-fixture",
+      "url": "https://forecast.weather.gov/showsigwx.php?warnzone=NYZ072#skynet-fixture",
       "raw_content": "URGENT - WEATHER MESSAGE (fixture). National Weather Service New York NY. ...WIND ADVISORY IN EFFECT FROM 2 PM TO 8 PM EDT TUESDAY... WHAT: West winds 20 to 30 mph with gusts up to 45 mph expected. WHERE: New York (Manhattan), Kings (Brooklyn) and Queens counties. WHEN: From 2 PM to 8 PM EDT Tuesday, September 22, 2026."
      }
     ]

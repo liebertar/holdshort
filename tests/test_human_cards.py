@@ -9,8 +9,8 @@ import json
 import tempfile
 import unittest
 
-from holdshort.core.models import Proposal, Verdict
-from holdshort.runtime.service import Runtime
+from backend.runtime.tower import Runtime
+from shared.models import Proposal, Verdict
 from sim import world as sim_world
 
 CONFIG = "configs/fleet.yaml"
@@ -60,7 +60,7 @@ def open_ids(runtime):
     return opened - closed
 
 
-def public_route(rationale="승객 위"):
+def public_route(rationale="over people"):
     return Proposal(asset_id="drone-01", action="fly_route", cost_usd=12.0,
                     blast_radius="public", rationale=rationale,
                     params={"legs": [{"lat": HERE[0], "lon": HERE[1], "alt_m": 60},
@@ -77,29 +77,29 @@ class HumanCardLedgerTest(unittest.TestCase):
         self.assertIs(decision.verdict, Verdict.HUMAN)
         rows = rows_for(self.runtime, first.id)
         self.assertEqual(rows, [(rows[0][0], "pending", "human", "human_blast")])
-        # 같은 카드가 서 있는 동안의 재신청: 같은 결정, 그래도 한 줄
+        # A repeat filing while the same card stands: same decision, still its own line
         repeat = public_route()
         again = self.runtime.file(repeat.to_dict())
         self.assertEqual((again.verdict, again.proposal_id), (Verdict.HUMAN, first.id))
         self.assertEqual([r[1:] for r in rows_for(self.runtime, repeat.id)],
                          [("pending", "human", "human_blast"), ("waiting", "human", "human_blast")])
         self.assertEqual(len(self.runtime.snapshot()["awaiting_human"]), 1)
-        # 승인: 카드 줄이 닫히고, 실행은 자기 줄을 남깁니다
-        approved = self.runtime.approve(first.id, "관제사", allow=True)
+        # Approval: the card's line closes, and the execution leaves its own line
+        approved = self.runtime.approve(first.id, "controller", allow=True)
         self.assertTrue(approved.committed)
         rows = rows_for(self.runtime, first.id)
         self.assertEqual([r[1] for r in rows], ["pending", "approved", "pending", "done"])
-        self.assertEqual(rows[0][0], rows[1][0], "카드를 연 줄을 닫습니다")
+        self.assertEqual(rows[0][0], rows[1][0], "closes the same line that opened the card")
         closed_card = next(e for e in lines(self.runtime) if e["id"] == rows[0][0]
                            and e["outcome"] == "approved")
-        self.assertEqual(closed_card["decision"]["approved_by"], "관제사")
+        self.assertEqual(closed_card["decision"]["approved_by"], "controller")
         self.assertEqual(closed_card["context"]["checks_run"][-1], "human")
         self.assertEqual(open_ids(self.runtime), set())
 
     def test_a_refusal_closes_the_card_line_as_denied(self):
         first = public_route()
         self.runtime.file(first.to_dict())
-        denied = self.runtime.approve(first.id, "관제사", allow=False)
+        denied = self.runtime.approve(first.id, "controller", allow=False)
         self.assertIs(denied.verdict, Verdict.DENIED)
         rows = rows_for(self.runtime, first.id)
         self.assertEqual([r[1] for r in rows], ["pending", "denied"])
@@ -116,8 +116,8 @@ class HumanCardLedgerTest(unittest.TestCase):
         rows = rows_for(self.runtime, first.id)
         self.assertEqual([(r[1], r[2], r[3]) for r in rows],
                          [("pending", "human", "human_blast"), ("lapsed", "denied", "card_lapsed")])
-        self.assertIsNone(self.runtime.approve(first.id, "관제사", allow=True),
-                          "내려간 카드는 승인할 수 없습니다")
+        self.assertIsNone(self.runtime.approve(first.id, "controller", allow=True),
+                          "a card that was taken down cannot be approved")
         self.assertEqual(open_ids(self.runtime), set())
 
 

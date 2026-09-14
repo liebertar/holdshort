@@ -29,7 +29,7 @@ class Answer(http.server.BaseHTTPRequestHandler):
 
 
 def free_block(size: int = 6) -> int:
-    """연달아 비어 있는 포트 size 개의 첫 번호. 함대는 기본 포트 + 1.. 을 봅니다."""
+    """The first of size free ports in a row. The fleet looks at the base port + 1.."""
     for _ in range(50):
         with socket.socket() as probe:
             probe.bind(("127.0.0.1", 0))
@@ -48,7 +48,7 @@ def free_block(size: int = 6) -> int:
         finally:
             for held in sockets:
                 held.close()
-    raise unittest.SkipTest("연달아 빈 포트를 못 찾았습니다")
+    raise unittest.SkipTest("could not find a run of free ports")
 
 
 class ResolveTest(unittest.TestCase):
@@ -96,7 +96,7 @@ class ResolveTest(unittest.TestCase):
         self.assertEqual(self.resolve(NEBIUS_API_KEY="ollama")["STACK_MODEL"], "rules")
         keyless = self.resolve(LLM_BASE_URL="https://api.tokenfactory.nebius.com/v1")
         self.assertEqual((keyless["STACK_MODEL"], keyless["LLM_BASE_URL"]), ("rules", ""),
-                         "키 없는 Nebius 는 모든 호출이 401 — 규칙이 쓰면서 모델 이름만 붙습니다")
+                         "keyless Nebius 401s every call — rules write it under a model's name")
 
     def test_one_ollama_serves_everyone_with_the_4b_and_thinking_off(self):
         self.serve(self.base)
@@ -121,14 +121,14 @@ class ResolveTest(unittest.TestCase):
                          (f"http://127.0.0.1:{self.base}/v1", "nemotron-3-nano:4b"))
 
     def test_the_tower_server_takes_the_runtime_before_11434(self):
-        self.serve(self.base)          # Ollama 앱(문맥 256k)
+        self.serve(self.base)          # the Ollama app (256k context)
         self.serve(self.base + 1)
-        self.serve(self.base + 6)      # 관제 서버(문맥 8k)
+        self.serve(self.base + 6)      # the runtime's server (8k context)
         found = self.resolve()
         self.assertEqual(found["STACK_MODEL"], "ollama-fleet")
         self.assertEqual((found["LLM_BASE_URL"], found["RUNTIME_SUPER"]),
                          (f"http://127.0.0.1:{self.base + 6}/v1", "nemotron-3-nano:4b"),
-                         "11434 는 문맥 256k 라 같은 4B 에 KV 캐시를 5 GB 넘게 더 얹습니다")
+                         "11434 has a 256k context: over 5 GB more KV cache for the same 4B")
         self.assertEqual(found["PER_ASSET_URLS"].split(), [f"http://127.0.0.1:{self.base + 1}/v1"])
 
     def test_the_fleet_script_lists_the_tower_and_refuses_an_overlap(self):
@@ -139,13 +139,13 @@ class ResolveTest(unittest.TestCase):
         status = subprocess.run(["bash", "scripts/ollama_fleet.sh", "status", "4"], env=env,
                                 capture_output=True, text=True, timeout=30)
         self.assertEqual(status.returncode, 0, status.stderr)
-        self.assertIn(f":{self.base + 6} (관제) 떠 있음", status.stdout)
-        self.assertIn(f":{self.base + 1} 꺼짐", status.stdout)
+        self.assertIn(f":{self.base + 6} (runtime) up", status.stdout)
+        self.assertIn(f":{self.base + 1} down", status.stdout)
         overlap = subprocess.run(["bash", "scripts/ollama_fleet.sh", "status", "4"],
                                  env={**env, "OLLAMA_TOWER_PORT": str(self.base + 2)},
                                  capture_output=True, text=True, timeout=30)
         self.assertNotEqual(overlap.returncode, 0)
-        self.assertIn("겹칩니다", overlap.stderr)
+        self.assertIn("overlaps the runtime server", overlap.stderr)
 
     def test_intake_follows_the_key_and_the_network(self):
         self.serve(self.base + 5)

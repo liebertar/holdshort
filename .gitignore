@@ -3,6 +3,9 @@ __pycache__/
 .venv/
 ledger.jsonl
 .env
+.env.*
+!.env.*.example
 models/
 *.jsonl
 .run/
+ARCHITECTURE.md

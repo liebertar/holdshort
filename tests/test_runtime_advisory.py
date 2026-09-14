@@ -9,10 +9,7 @@ import json
 import tempfile
 import unittest
 
-from holdshort.core.geo import Volume, box
-from holdshort.core.models import Proposal, Verdict
-from holdshort.llm.client import LlmReply, TieredLlm
-from holdshort.runtime.advisory import (
+from backend.runtime.advisory import (
     ADVISORY_AFTER,
     CLIMB_M,
     AdvisoryDesk,
@@ -22,11 +19,14 @@ from holdshort.runtime.advisory import (
     parse_advice,
     rule_pick,
 )
-from holdshort.runtime.service import Runtime
+from backend.runtime.tower import Runtime
+from shared.geo import Volume, box
+from shared.llm.client import LlmReply, TieredLlm
+from shared.models import Proposal, Verdict
 from sim import world as sim_world
 
 CONFIG = "configs/fleet.yaml"
-ZONE_ITEM = {"id": "nofly-t", "kind": "notam", "name": "시험 회랑", "text": sim_world.ZONE_TEXT,
+ZONE_ITEM = {"id": "nofly-t", "kind": "notam", "name": "test corridor", "text": sim_world.ZONE_TEXT,
              "published_tick": 525, "until_tick": 900}
 HERE = (40.7100, -73.9855)
 
@@ -45,7 +45,7 @@ class RecordingAdapter:
 
 
 class StubSuper(TieredLlm):
-    """정해진 문장으로 답하는 Super 티어."""
+    """A Super tier that answers with a fixed text."""
 
     def __init__(self, text: str):
         super().__init__(base_url="http://stub", models={"super": "stub-super"},
@@ -66,7 +66,7 @@ def make_runtime(llm=None):
     adapter = RecordingAdapter()
     runtime.adapter = adapter
     runtime.committer.adapter = adapter
-    runtime.advisory_async = False       # 시험은 권고가 원장에 적힌 다음을 봅니다
+    runtime.advisory_async = False       # tests inspect the ledger after the advisory is written
     runtime.notice_async = False
     if llm is not None:
         runtime.llm = llm
@@ -110,11 +110,11 @@ class TriggerTest(unittest.TestCase):
     def test_exactly_three_consecutive_refusals_and_a_success_resets(self):
         for _ in range(ADVISORY_AFTER - 1):
             self.assertIs(file_route(self.runtime, THROUGH_ZONE).verdict, Verdict.DENIED)
-        self.assertEqual(advisories(self.runtime), [], "두 번은 재작성 사다리 안입니다")
+        self.assertEqual(advisories(self.runtime), [], "two are still within the rewrite ladder")
         self.assertEqual(self.runtime.snapshot()["advisories"], [])
-        # 승인이 하나 나가면 연속은 끊깁니다
+        # One approval breaks the streak
         self.assertTrue(file_route(self.runtime, AWAY).committed)
-        self.runtime.tick += 20         # 중복 방지 창 밖
+        self.runtime.tick += 20         # outside the dedupe window
         for _ in range(ADVISORY_AFTER - 1):
             file_route(self.runtime, THROUGH_ZONE)
         self.assertEqual(advisories(self.runtime), [])
@@ -128,13 +128,14 @@ class TriggerTest(unittest.TestCase):
         self.assertEqual(entry["context"]["checks_run"], ["advisory"])
         params = entry["proposal"]["params"]
         self.assertEqual(params["trigger"], "refusals")
-        self.assertEqual(len(params["refusals"]), ADVISORY_AFTER, "승인 뒤의 거절만 셉니다")
+        self.assertEqual(len(params["refusals"]), ADVISORY_AFTER,
+                         "only refusals after the approval count")
         self.assertEqual({r["code"] for r in params["refusals"]}, {"airspace"})
         self.assertEqual({r["blocked_volume"] for r in params["refusals"]}, {"nofly-t"})
         shown = self.runtime.snapshot()["advisories"]
         self.assertEqual([(a["asset"], a["ledger_id"], a["chosen"]) for a in shown],
                          [("drone-01", entry["id"], params["chosen"])])
-        # 네 번째 거절에는 새 권고가 없고, 실행된 것도 없습니다 — 권고는 아무것도 바꾸지 않습니다
+        # A fourth refusal gets no new advisory and nothing executes — an advisory changes nothing
         file_route(self.runtime, THROUGH_ZONE)
         self.assertEqual(len(advisories(self.runtime)), 1)
         self.assertEqual([s[1] for s in self.adapter.sent], ["fly_route"])
@@ -145,8 +146,9 @@ class TriggerTest(unittest.TestCase):
         params = advisories(self.runtime)[0]["proposal"]["params"]
         by_id = {o["id"]: o for o in params["options"]}
         self.assertEqual(list(by_id), ["climb", "notice_window", "decline", "escalate"])
-        self.assertFalse(by_id["climb"]["legal"], "구역은 400ft 까지라 30m 올려도 안입니다")
-        self.assertIn("시험 회랑", by_id["climb"]["why"])
+        self.assertFalse(by_id["climb"]["legal"],
+                         "the zone reaches 400ft, so climbing 30m is still inside it")
+        self.assertIn("test corridor", by_id["climb"]["why"])
         self.assertEqual((by_id["notice_window"]["legal"], by_id["notice_window"]["until_tick"]),
                          (True, 900))
         self.assertTrue(by_id["decline"]["legal"] and by_id["escalate"]["legal"])
@@ -157,9 +159,9 @@ class TriggerTest(unittest.TestCase):
 
     def test_a_decline_after_refusals_is_an_advisory_and_a_plain_decline_is_not(self):
         decline = Proposal(asset_id="drone-01", action="decline_job", cost_usd=0.0,
-                           blast_radius="none", rationale="규정상 경로 없음")
+                           blast_radius="none", rationale="no legal route")
         self.assertTrue(self.runtime.file(decline.to_dict()).committed)
-        self.assertEqual(advisories(self.runtime), [], "거절이 없었으면 권고도 없습니다")
+        self.assertEqual(advisories(self.runtime), [], "no refusals, no advisory")
         file_route(self.runtime, THROUGH_ZONE)
         self.runtime.tick += 20
         self.assertTrue(self.runtime.file(decline.to_dict()).committed)
@@ -173,13 +175,14 @@ class TriggerTest(unittest.TestCase):
                          "decline_after_refusals")
 
     def test_the_same_block_is_not_advised_again_and_a_new_block_is(self):
-        """실주행: 남이 착륙대를 쓰는 동안 몇 틱마다 재신청 → 세 번째마다 같은 '틱 X 까지 대기'.
-        같은 막힘이 이어지는 동안은 한 번이고, 막힘이 바뀌어 다시 세 번 쌓이면 또 씁니다."""
+        """Live run: refiling every few ticks while someone else held the landing pad → the same
+        'hold until tick X' every third time. One advisory while the same block lasts; when the
+        block changes and three refusals pile up again, it writes another."""
         for _ in range(ADVISORY_AFTER * 3):
             file_route(self.runtime, THROUGH_ZONE)
         self.assertEqual(len(advisories(self.runtime)), 1)
-        # 다른 것에 막힙니다(구역 대신 건물) → 세 번 쌓이면 새 권고
-        self.runtime.airspace.add(Volume(id="bldg-new", name="새 건물",
+        # Blocked by something else (a building, not the zone) → three more make a new advisory
+        self.runtime.airspace.add(Volume(id="bldg-new", name="new building",
                                          polygon=box(40.7040, -73.9860, 40.7050, -73.9850),
                                          floor_m=0.0, ceiling_m=130.0, clearance_m=50.0,
                                          rule="forbidden"))
@@ -193,15 +196,15 @@ class TriggerTest(unittest.TestCase):
 
     def test_a_committed_decline_resets_the_streak(self):
         decline = Proposal(asset_id="drone-01", action="decline_job", cost_usd=0.0,
-                           blast_radius="none", rationale="규정상 경로 없음")
+                           blast_radius="none", rationale="no legal route")
         file_route(self.runtime, THROUGH_ZONE)
         self.assertTrue(self.runtime.file(decline.to_dict()).committed)
         self.assertEqual(len(advisories(self.runtime)), 1)
-        self.assertEqual(self.runtime.advisor.streaks, {}, "주문이 사라졌으니 연속도 끊깁니다")
+        self.assertEqual(self.runtime.advisor.streaks, {}, "the order is gone, so is the streak")
         self.runtime.tick += 20
         for _ in range(ADVISORY_AFTER - 1):
             file_route(self.runtime, THROUGH_ZONE)
-        self.assertEqual(len(advisories(self.runtime)), 1, "새 주문의 거절은 새로 셉니다")
+        self.assertEqual(len(advisories(self.runtime)), 1, "a new order's refusals count afresh")
         file_route(self.runtime, THROUGH_ZONE)
         noted = advisories(self.runtime)
         self.assertEqual(len(noted), 2)
@@ -209,12 +212,12 @@ class TriggerTest(unittest.TestCase):
 
     def test_a_duplicate_decline_writes_no_second_advisory(self):
         decline = Proposal(asset_id="drone-01", action="decline_job", cost_usd=0.0,
-                           blast_radius="none", rationale="규정상 경로 없음")
+                           blast_radius="none", rationale="no legal route")
         file_route(self.runtime, THROUGH_ZONE)
         self.assertTrue(self.runtime.file(decline.to_dict()).committed)
         again = self.runtime.file(Proposal(asset_id="drone-01", action="decline_job",
                                            cost_usd=0.0, blast_radius="none",
-                                           rationale="규정상 경로 없음").to_dict())
+                                           rationale="no legal route").to_dict())
         self.assertEqual((again.verdict, again.code), (Verdict.DENIED, "duplicate"))
         self.assertEqual(len(advisories(self.runtime)), 1)
         self.assertEqual([s[1] for s in self.adapter.sent], ["decline_job"])
@@ -251,7 +254,7 @@ class TriggerTest(unittest.TestCase):
 
 
 class JudgeTest(unittest.TestCase):
-    """선택지의 합법 여부는 같은 판정 함수가 말합니다."""
+    """The same judging function decides whether an option is legal."""
 
     def roof(self, ceiling_m: float):
         runtime, adapter = make_runtime()
@@ -275,7 +278,7 @@ class JudgeTest(unittest.TestCase):
         self.assertEqual(params["chosen"], "decline")
 
     def test_a_lifted_route_over_a_30_m_roof_is_legal_and_chosen(self):
-        # 옥상 30m + 이격 50m = 80m 까지 막힘. 60m 는 거절, 90m 는 통과합니다.
+        # Roof 30m + margin 50m = blocked up to 80m. 60m is refused, 90m passes.
         runtime, adapter = self.roof(30.0)
         route = legs([HERE, (40.7195, -73.9855), (40.7350, -73.9855)], 60)
         for _ in range(ADVISORY_AFTER):
@@ -285,29 +288,30 @@ class JudgeTest(unittest.TestCase):
         climb = next(o for o in params["options"] if o["id"] == "climb")
         self.assertTrue(climb["legal"], climb["why"])
         self.assertEqual(params["chosen"], "climb")
-        self.assertEqual(adapter.sent, [], "권고는 평가만 하고 실행하지 않습니다")
+        self.assertEqual(adapter.sent, [], "an advisory only evaluates; it executes nothing")
 
     def test_a_pad_filed_by_resource_alone_is_judged_against_that_pad(self):
-        """reserve_pad 는 resource 만 싣고 params.pad 가 없을 수 있습니다. 끝점 검사의 목적지는
-        resource 입니다 — 안 넘기면 권고가 끝점 차이를 못 보고 '올라가면 된다' 고 합니다."""
+        """reserve_pad may carry only resource, with no params.pad. The endpoint check's
+        destination is the resource — without it the advisory misses the endpoint gap and says
+        'just climb'."""
         runtime, _ = make_runtime()
         runtime.pad_coords = {"pad:launch": (40.7200, -73.9800)}
         runtime.airspace.add(Volume(id="bldg-roof", name="roof 30",
                                     polygon=box(40.7140, -73.9860, 40.7150, -73.9850),
                                     floor_m=0.0, ceiling_m=30.0, clearance_m=50.0,
                                     rule="forbidden"))
-        astray = legs([HERE, (40.7145, -73.9855), (40.7200, -73.9855)], 60)   # 끝이 착륙대에서 460m
+        astray = legs([HERE, (40.7145, -73.9855), (40.7200, -73.9855)], 60)   # ends 460m from pad
         for _ in range(ADVISORY_AFTER):
             decision = runtime.file(Proposal(asset_id="drone-01", action="reserve_pad",
                                              cost_usd=28.0, blast_radius="schedule",
                                              rationale="", resource="pad:launch",
                                              params={"legs": astray}).to_dict())
             self.assertIs(decision.verdict, Verdict.DENIED)
-            self.assertIn("끝점", decision.reason)
+            self.assertIn("last point", decision.reason)
         params = advisories(runtime)[0]["proposal"]["params"]
         climb = next(o for o in params["options"] if o["id"] == "climb")
         self.assertFalse(climb["legal"], climb["why"])
-        self.assertIn("끝점", climb["why"])
+        self.assertIn("last point", climb["why"])
 
     def test_a_crossing_offers_holding_until_the_other_corridor_clears(self):
         runtime, adapter = make_runtime()
@@ -325,13 +329,15 @@ class JudgeTest(unittest.TestCase):
         until = decision.detail["blocked_until_tick"]
         self.assertEqual((by_id["hold"]["legal"], by_id["hold"]["until_tick"]), (True, until))
         self.assertIn("drone-02", by_id["hold"]["why"])
-        self.assertTrue(by_id["climb"]["legal"], "상대 회랑은 위아래 ±27m 라 30m 위는 비켜 갑니다")
+        self.assertTrue(by_id["climb"]["legal"],
+                        "the other corridor spans ±27m vertically, so 30m up clears it")
         self.assertEqual(params["chosen"], "hold")
         self.assertEqual({r["blocked_asset"] for r in params["refusals"]}, {"drone-02"})
 
 
 class ModelTest(unittest.TestCase):
-    """모델은 목록에서 하나를 고르고 요약을 씁니다. 목록 밖이면 규칙이 고르고 문구도 틀로 씁니다."""
+    """The model picks one option from the list and writes the summary. Outside the list, a rule
+    picks and the text comes from a template."""
 
     def setUp(self):
         self.refusals = [Refusal("drone-01", 600 + i, "airspace", "traffic", "traffic", None,
@@ -346,7 +352,7 @@ class ModelTest(unittest.TestCase):
         self.assertEqual(rule_pick([Option("hold", "", False, ""), Option("climb", "", True, "")]),
                          "climb")
         airborne = build_options(self.refusals, lambda r, route: "roof", lambda v: None, True)
-        self.assertFalse(airborne[0].legal, "떠 있는 기체는 지상 대기를 할 수 없습니다")
+        self.assertFalse(airborne[0].legal, "an airborne aircraft cannot hold on the ground")
         self.assertFalse(airborne[1].legal)
         self.assertEqual(rule_pick(airborne), "decline")
 
@@ -373,7 +379,7 @@ class ModelTest(unittest.TestCase):
             self.assertEqual(llm.stats["super"].fallback, 1)
 
     def test_a_choice_echoed_with_the_brackets_of_the_list_is_read(self):
-        """실주행: 권고 160건 중 155건이 "[hold]" 로 답해 규칙 선택으로 떨어졌습니다."""
+        """Live run: 155 of 160 advisories answered "[hold]" and fell back to the rule's pick."""
         for text in ('{"choice": "[hold]", "summary": "Wait it out."}',
                      '{"choice": " [HOLD] ", "summary": "Wait it out."}',
                      '{"choice": "\'hold\'", "summary": "Wait it out."}'):

@@ -1,26 +1,30 @@
 #!/usr/bin/env bash
-# 드론마다 Ollama 서버 하나 — 11435, 11436, … 에 N 개 (기본 4).
+# One Ollama server per drone — N of them on 11435, 11436, … (default 4).
 #
-# 왜: Ollama 는 nemotron-3-nano(Mamba 혼합) 계열에 동시 처리 슬롯 1개를 강제합니다
-# (OLLAMA_NUM_PARALLEL 은 무시됨). 서버 하나에 기체 4대가 초안을 물으면 줄을 서서 뒤의 셋이
-# 타임아웃을 맞습니다(실주행: 초안 9건 중 7건 잘림, nano 승인 0). 서버를 기체 수만큼 띄우면
-# 슬롯도 기체 수만큼입니다. 모델 폴더(~/.ollama/models, OLLAMA_MODELS)는 그대로 공유하고,
-# 서버마다 작은 4B(nemotron-3-nano:4b, 2.8 GB)를 따로 올립니다.
+# Why: Ollama forces a single concurrent slot on the nemotron-3-nano (Mamba hybrid) family
+# (OLLAMA_NUM_PARALLEL is ignored). Four aircraft asking one server for drafts queue up and the
+# last three time out (live run: 7 of 9 drafts cut off, 0 nano approvals). One server per
+# aircraft gives one slot per aircraft. The model folder (~/.ollama/models, OLLAMA_MODELS) is
+# shared as is, and each server loads its own small 4B (nemotron-3-nano:4b, 2.8 GB).
 #
-# 관제 서버(11439) 하나를 더 띄웁니다 — 런타임의 Super 대역(공지 읽기·권고)이 씁니다. 전에는 기본
-# 서버(11434, Ollama 앱)를 썼는데, 앱은 문맥 창을 256k 로 잡아 같은 4B 에 KV 캐시를 5 GB 넘게 더
-# 얹었습니다(Ollama 표시 8.4 GB, 8k 에서는 3.0 GB). 공지 한 편은 2천 자 안팎이라 8k 면 넉넉합니다.
-# 실제 메모리는 Ollama 표시보다 큽니다: 서버마다 가중치를 제 힙에 따로 올려(footprint 의 MALLOC_LARGE)
-# 8k 서버 하나가 약 7.5 GB, 넷이면 30 GB 입니다(2026-09-11 footprint 로 잼).
-# 관제 서버를 안 띄우려면 OLLAMA_FLEET_TOWER=0 — 그러면 런타임은 전처럼 11434 를 씁니다.
+# One more server is started: the runtime's model server (11439), used by the runtime's Super
+# stand-in (reading notices, advisories). It used to be the default server (11434, the Ollama
+# app), but the app sets a 256k context window, which put over 5 GB more KV cache on the same 4B
+# (Ollama shows 8.4 GB; 3.0 GB at 8k). A notice is around 2,000 characters, so 8k is plenty.
+# Real memory is higher than Ollama shows: each server loads the weights into its own heap
+# (MALLOC_LARGE in footprint), so one 8k server is about 7.5 GB and four are 30 GB (measured
+# with footprint, 2026-09-11).
+# To skip the runtime's model server, set OLLAMA_FLEET_TOWER=0 — the runtime then uses 11434 as
+# before.
 #
-#   scripts/ollama_fleet.sh start  [N]   # 서버를 띄우고 4B 를 한 번씩 데워 둡니다(첫 초안이 적재를 기다리지 않게)
+#   scripts/ollama_fleet.sh start  [N]   # start the servers and warm each 4B once
+#                                        # (so the first draft does not wait for the load)
 #   scripts/ollama_fleet.sh stop   [N]
 #   scripts/ollama_fleet.sh status [N]
 #
-# 로그는 .run/ollama-<port>.log, pid 는 .run/ollama-<port>.pid. 띄운 뒤 찍히는
-# LLM_PER_ASSET_URLS 를 export 하고 scripts/dev.sh 를 돌리면 기체 i 가 i 번째 서버를 씁니다
-# (.env.example 의 "로컬 함대" 블록).
+# Logs go to .run/ollama-<port>.log, pids to .run/ollama-<port>.pid. Export the
+# LLM_PER_ASSET_URLS printed after start and run scripts/dev.sh: aircraft i uses server i
+# (the local fleet block in .env.local.example).
 set -euo pipefail
 cd "$(dirname "$0")/.."
 mkdir -p .run
@@ -28,17 +32,18 @@ mkdir -p .run
 COMMAND="${1:-status}"
 SIZE="${2:-${OLLAMA_FLEET_SIZE:-4}}"
 MODEL="${OLLAMA_FLEET_MODEL:-nemotron-3-nano:4b}"
-BASE_PORT="${OLLAMA_FLEET_BASE_PORT:-11434}"     # 이 다음 포트부터 씁니다
-# 문맥 창. Ollama 기본은 VRAM 을 보고 256k 까지 잡아 4B 하나가 8.4 GB 를 먹습니다. 초안은 지도 읽기
-# 약 1.5k 토큰 + 답 700 토큰이라 8k 면 넉넉하고, 서버 4개가 함께 메모리에 있어야 합니다.
+BASE_PORT="${OLLAMA_FLEET_BASE_PORT:-11434}"     # servers start at the port after this
+# Context window. Ollama's default sizes it from VRAM, up to 256k, and one 4B then takes 8.4 GB.
+# A draft is about 1.5k tokens of map reading + a 700-token answer, so 8k is plenty, and four
+# servers have to fit in memory together.
 CONTEXT="${OLLAMA_FLEET_CONTEXT:-8192}"
-# 데워 둔 모델을 얼마나 오래 들고 있을지. 데모 한 판(13분)보다 넉넉히.
+# How long a warmed model stays loaded. Comfortably longer than one demo round (13 min).
 KEEP_ALIVE="${OLLAMA_FLEET_KEEP_ALIVE:-2h}"
-# 관제 서버. scripts/resolve_stack.sh 가 런타임 자리로 이 포트를 먼저 봅니다.
+# The runtime's model server. scripts/resolve_stack.sh tries this port first for the runtime.
 TOWER="${OLLAMA_FLEET_TOWER:-1}"
 TOWER_PORT="${OLLAMA_TOWER_PORT:-11439}"
 if [ "$TOWER" = 1 ] && [ "$((BASE_PORT + SIZE))" -ge "$TOWER_PORT" ]; then
-  echo "함대(:$((BASE_PORT + 1))..:$((BASE_PORT + SIZE)))가 관제 서버 :$TOWER_PORT 와 겹칩니다 — OLLAMA_TOWER_PORT 를 옮기세요" >&2
+  echo "the fleet (:$((BASE_PORT + 1))..:$((BASE_PORT + SIZE))) overlaps the runtime server :$TOWER_PORT — move OLLAMA_TOWER_PORT" >&2
   exit 2
 fi
 
@@ -46,14 +51,14 @@ port_of() { echo $((BASE_PORT + $1)); }
 url_of() { echo "http://127.0.0.1:$(port_of "$1")/v1"; }
 is_up() { curl -sf --max-time 1 "http://127.0.0.1:$1/api/version" >/dev/null 2>&1; }
 
-# 이 스크립트가 다루는 포트 전부: 드론 서버 N 개, 그리고 관제 서버.
+# Every port this script manages: N drone servers, plus the runtime's model server.
 ports() {
   for i in $(seq 1 "$SIZE"); do port_of "$i"; done
   if [ "$TOWER" = 1 ]; then echo "$TOWER_PORT"; fi
 }
 
 tower_note() {
-  if [ "$TOWER" = 1 ]; then echo " + 관제 서버 :$TOWER_PORT"; fi
+  if [ "$TOWER" = 1 ]; then echo " + runtime server :$TOWER_PORT"; fi
 }
 
 urls_line() {
@@ -65,13 +70,13 @@ urls_line() {
 start_one() {
   local port=$1
   if is_up "$port"; then
-    echo "  :$port 이미 떠 있음"
+    echo "  :$port already up"
     return
   fi
   OLLAMA_HOST="127.0.0.1:$port" OLLAMA_KEEP_ALIVE="$KEEP_ALIVE" OLLAMA_CONTEXT_LENGTH="$CONTEXT" \
     nohup ollama serve >".run/ollama-$port.log" 2>&1 &
   echo $! >".run/ollama-$port.pid"
-  echo "  :$port 시작 (pid $!, 로그 .run/ollama-$port.log)"
+  echo "  :$port started (pid $!, log .run/ollama-$port.log)"
 }
 
 wait_up() {
@@ -80,12 +85,12 @@ wait_up() {
     is_up "$port" && return 0
     sleep 0.2
   done
-  echo "  :$port 가 20초 안에 안 떴습니다 — .run/ollama-$port.log 를 보세요" >&2
+  echo "  :$port did not come up within 20 s — see .run/ollama-$port.log" >&2
   return 1
 }
 
 warm_one() {
-  # 작은 질문 하나로 모델을 올려 둡니다. 첫 진짜 초안이 적재(수 초)를 기다리지 않게.
+  # Load the model with one tiny question, so the first real draft does not wait seconds for it.
   local port=$1 started ended
   started=$(date +%s)
   curl -s --max-time 180 "http://127.0.0.1:$port/v1/chat/completions" \
@@ -94,16 +99,17 @@ warm_one() {
     >".run/ollama-$port.warm.json" 2>&1 || true
   ended=$(date +%s)
   if grep -q '"choices"' ".run/ollama-$port.warm.json"; then
-    echo "  :$port $MODEL 데움 ($((ended - started))초)"
+    echo "  :$port $MODEL warmed ($((ended - started)) s)"
   else
-    echo "  :$port 데우기 실패 — $(head -c 200 ".run/ollama-$port.warm.json")" >&2
+    echo "  :$port warm-up failed — $(head -c 200 ".run/ollama-$port.warm.json")" >&2
   fi
 }
 
 stop_one() {
   local port=$1 pid=""
   [ -f ".run/ollama-$port.pid" ] && pid=$(cat ".run/ollama-$port.pid")
-  # pid 파일이 없거나 낡았으면 포트를 쥔 프로세스를 찾습니다. 11434(기본 서버)는 여기 안 옵니다.
+  # No pid file, or a stale one: find the process holding the port. 11434 (the default server)
+  # never gets here.
   if [ -z "$pid" ] || ! kill -0 "$pid" 2>/dev/null; then
     pid=$(lsof -nP -tiTCP:"$port" -sTCP:LISTEN 2>/dev/null | head -1 || true)
   fi
@@ -113,40 +119,41 @@ stop_one() {
       kill -0 "$pid" 2>/dev/null || break
       sleep 0.2
     done
-    echo "  :$port 내림 (pid $pid)"
+    echo "  :$port stopped (pid $pid)"
   else
-    echo "  :$port 떠 있지 않음"
+    echo "  :$port not running"
   fi
   rm -f ".run/ollama-$port.pid"
 }
 
-# /api/ps 답을 한 줄로: 모델 이름 (메모리, 문맥 창)
+# The /api/ps answer on one line: model name (memory, context window)
 PS_SUMMARY=$(cat <<'PY'
 import json, sys
 loaded = json.load(sys.stdin).get("models") or []
 print(", ".join("%s (%.1f GB, ctx %s)" % (m["name"], m.get("size_vram", 0) / 1e9, m.get("context_length"))
-               for m in loaded) or "(올라간 모델 없음)")
+               for m in loaded) or "(no model loaded)")
 PY
 )
 
 status_one() {
   local port=$1 loaded role=""
-  if [ "$port" = "$TOWER_PORT" ]; then role=" (관제)"; fi
+  if [ "$port" = "$TOWER_PORT" ]; then role=" (runtime)"; fi
   if is_up "$port"; then
     loaded=$(curl -s --max-time 2 "http://127.0.0.1:$port/api/ps" | python3 -c "$PS_SUMMARY" 2>/dev/null || echo "?")
-    echo "  :$port$role 떠 있음 — $loaded"
+    echo "  :$port$role up — $loaded"
   else
-    echo "  :$port$role 꺼짐"
+    echo "  :$port$role down"
   fi
 }
 
 case "$COMMAND" in
   start)
-    echo "Ollama 함대 $SIZE 대$(tower_note) ($MODEL, ctx $CONTEXT, keep-alive $KEEP_ALIVE)"
+    echo "Ollama fleet: $SIZE servers$(tower_note) ($MODEL, ctx $CONTEXT, keep-alive $KEEP_ALIVE)"
     for port in $(ports); do start_one "$port"; done
     for port in $(ports); do wait_up "$port"; done
-    # 같이 데웁니다. 같은 blob 을 mmap 하므로 따로 하는 것보다 빠릅니다. 서버 자체도 이
-    # 셸의 자식이라 wait 는 데우기 pid 만 — 아니면 서버가 내려갈 때까지 안 돌아옵니다.
+    # Warm them together: they mmap the same blob, so it beats one at a time. The servers are
+    # children of this shell too, so wait only on the warm-up pids — otherwise wait would not
+    # return until the servers go down.
     warmers=""
     for port in $(ports); do
       warm_one "$port" &
@@ -157,7 +164,7 @@ case "$COMMAND" in
     echo
     echo "export LLM_PER_ASSET_URLS=\"$(urls_line)\""
     if [ "$TOWER" = 1 ]; then
-      echo "# 관제(런타임 Super 대역) http://127.0.0.1:$TOWER_PORT/v1 — scripts/dev.sh 가 알아서 씁니다"
+      echo "# runtime server (Super stand-in) http://127.0.0.1:$TOWER_PORT/v1 — scripts/dev.sh uses it"
     fi
     ;;
   stop)
@@ -168,7 +175,7 @@ case "$COMMAND" in
     echo "LLM_PER_ASSET_URLS=\"$(urls_line)\""
     ;;
   *)
-    echo "사용법: $0 start|stop|status [N]" >&2
+    echo "usage: $0 start|stop|status [N]" >&2
     exit 2
     ;;
 esac

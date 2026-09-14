@@ -16,11 +16,11 @@ import sys
 import urllib.error
 import urllib.request
 
-from holdshort.agent.detect import Concern
-from holdshort.agent.propose import Proposer, system_for
-from holdshort.llm.client import LlmTier, TieredLlm, parse_json_object
-from holdshort.runtime.arbiter import SYSTEM as ARBITER_SYSTEM
-from holdshort.runtime.arbiter import parse_verdict
+from backend.runtime.arbiter import SYSTEM as ARBITER_SYSTEM
+from backend.runtime.arbiter import parse_verdict
+from drone.agent.detect import Concern
+from drone.agent.propose import Proposer, system_for
+from shared.llm.client import LlmTier, TieredLlm, parse_json_object
 
 
 def list_models(base_url: str, api_key: str) -> list[str]:
@@ -31,7 +31,7 @@ def list_models(base_url: str, api_key: str) -> list[str]:
         with urllib.request.urlopen(request, timeout=10) as response:
             payload = json.loads(response.read())
     except (urllib.error.URLError, TimeoutError, OSError, json.JSONDecodeError) as error:
-        print(f"GET /models 실패: {error}")
+        print(f"GET /models failed: {error}")
         return []
     ids = [item.get("id", "") for item in payload.get("data", [])]
     return [name for name in ids if "nemotron" in name.lower()]
@@ -44,28 +44,28 @@ def main() -> int:
         "ultra": os.getenv("MODEL_ULTRA", ""),
     })
     if not llm.enabled:
-        print("LLM_BASE_URL 과 MODEL_* 가 필요합니다 (.env.example 참고)")
+        print("LLM_BASE_URL and MODEL_* are required (see .env.local.example)")
         return 1
     print(f"server {llm.base_url} ({llm.host}), timeout {llm.timeout_s:.0f}s, "
           f"extra {json.dumps(llm.request_extra)}")
     print("nemotron models listed:", ", ".join(list_models(llm.base_url, llm.api_key)) or "(none)")
 
     concern = Concern(kind="needs_route", urgency="normal",
-                      detail="배달지 Union Square, 배터리 88%")
+                      detail="delivering to Union Square, battery 88%")
     telemetry = {"id": "drone-01", "model": "dv-x500", "state": "ready", "battery": 88.0,
                  "vibration": 0.1, "autonomy_health": 1.0, "passengers": 0, "cargo": 6}
     form_user = Proposer._brief(concern, telemetry, "pad:launch")
     arbiter_user = ("Resource: pad:launch\n"
                     "1. asset=drone-01 action=reserve_pad impact=schedule battery=40% passengers=0 "
-                    "why=정비 점검\n"
+                    "why=maintenance check\n"
                     "2. asset=drone-02 action=reserve_pad impact=cargo battery=9% passengers=0 "
-                    "why=배터리 9%")
+                    "why=battery 9%")
 
     failed = []
     for tier in LlmTier:
         model = llm.model_for(tier)
         if not model:
-            print(f"[{tier.value}] 모델 없음")
+            print(f"[{tier.value}] no model")
             failed.append(tier.value)
             continue
         if tier is LlmTier.ULTRA:
@@ -76,7 +76,7 @@ def main() -> int:
                             json_object=True)
             parsed = parse_json_object(reply.text) if reply else None
         if reply is None:
-            print(f"[{tier.value}] {model}: 답 없음 (타임아웃 또는 오류)")
+            print(f"[{tier.value}] {model}: no answer (timeout or error)")
             failed.append(tier.value)
             continue
         print(f"[{tier.value}] {model} via={reply.via} {reply.latency_ms}ms "
@@ -85,7 +85,7 @@ def main() -> int:
             print(f"    raw: {reply.text[:200]!r}")
             failed.append(tier.value)
     if failed:
-        print(f"쓸 수 있는 답이 없는 티어: {', '.join(failed)} — 그 티어는 규칙이 대신합니다")
+        print(f"tiers with no usable answer: {', '.join(failed)} — rules stand in for them")
         return 1
     return 0
 

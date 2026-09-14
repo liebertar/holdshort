@@ -1,0 +1,49 @@
+# The whole stack on a shared dev server (for example a Nebius VM). Services come from the local
+# file (extends); dev changes only what it needs: always restart, secrets in .env.dev, own volume.
+#   cp .env.dev.example .env.dev      # NEBIUS_API_KEY, TAVILY_API_KEY
+#   docker compose -f docker-compose.dev.yml --env-file .env.dev up -d --build
+
+name: sky-net
+
+x-dev: &dev
+  restart: always
+  env_file:
+    - path: .env.dev
+      required: false
+
+services:
+  sim:
+    extends: {file: docker-compose.local.yml, service: sim}
+    <<: *dev
+  runtime:
+    extends: {file: docker-compose.local.yml, service: runtime}
+    <<: *dev
+    depends_on: [sim]
+    volumes: [ledger-dev:/data]
+  ui:
+    extends: {file: docker-compose.local.yml, service: ui}
+    <<: *dev
+    depends_on: [runtime]
+  drone-01:
+    extends: {file: docker-compose.local.yml, service: drone-01}
+    <<: *dev
+    depends_on: [runtime]
+  drone-02:
+    extends: {file: docker-compose.local.yml, service: drone-02}
+    <<: *dev
+    depends_on: [runtime]
+  drone-03:
+    extends: {file: docker-compose.local.yml, service: drone-03}
+    <<: *dev
+    depends_on: [runtime]
+  drone-04:
+    extends: {file: docker-compose.local.yml, service: drone-04}
+    <<: *dev
+    depends_on: [runtime]
+
+networks:
+  fleet: {}
+  world: {}
+
+volumes:
+  ledger-dev: {}

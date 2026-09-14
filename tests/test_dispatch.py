@@ -26,8 +26,8 @@ from sim.world import LANDING_AREAS, PARCELS_PER_STOP, STOPS_PER_TRIP, Simulatio
 
 
 def old_assign_job(world, vehicle):
-    """World._assign_job 의 옛 본문 그대로. 마지막 두 줄(배달지 대입)만 정차 반환으로
-    바꿨습니다."""
+    """The old body of World._assign_job, verbatim. Only the last two lines (setting the
+    drop-off) were changed to return the stop."""
     taken = {other.job_label for other in world.vehicles.values()
              if other is not vehicle and other.job_label}
     pool = [area for area in LANDING_AREAS
@@ -45,8 +45,8 @@ def old_assign_job(world, vehicle):
 
 
 def _drive(world, pick, rounds: int = 80) -> list:
-    """정차를 뽑고 그대로 세계에 반영하며 rounds 번. 두 세계가 같은 상태를 지나야
-    비교가 뜻이 있습니다."""
+    """Picks a stop and applies it straight to the world, rounds times. The comparison only
+    means something if both worlds pass through the same states."""
     names = []
     vehicles = list(world.vehicles.values())
     for step in range(rounds):
@@ -81,11 +81,11 @@ class RuleDispatcherIsTheOldCodeTest(unittest.TestCase):
             self.assertIsNone(RuleDispatcher().next_stop(world, world.vehicles["drone-01"]))
 
 
-# ---------- 가짜 cuOpt 서버 ----------
+# ---------- Fake cuOpt server ----------
 
 
 def _solution_for(body: dict, keys: str = "ids") -> dict:
-    """cuOpt 모양의 답. 보낸 과제를 기체마다 번갈아 나눠 줍니다."""
+    """A cuOpt-shaped answer. Deals the tasks sent out to the aircraft in turn."""
     ids = body["fleet_data"]["vehicle_ids"]
     tasks = body["task_data"]["task_ids"]
     routes = {}
@@ -109,8 +109,8 @@ class FakeCuOpt(http.server.BaseHTTPRequestHandler):
     keys = "ids"
     post_status = 200
     polls_pending = 1
-    mangle = None            # 답을 망가뜨리는 함수(시험마다)
-    trickle_s = 0.0          # 0 이 아니면 답 본문을 한 바이트씩 이만큼 간격으로 흘립니다
+    mangle = None            # function that breaks the answer (per test)
+    trickle_s = 0.0          # non-zero: the body goes out a byte at a time, this far apart
 
     def do_POST(self):
         length = int(self.headers.get("Content-Length") or 0)
@@ -124,7 +124,7 @@ class FakeCuOpt(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
         type(self).gets.append(self.path)
         if len(type(self).gets) <= type(self).polls_pending:
-            self._json({"reqId": "req-1"})      # 아직 푸는 중입니다
+            self._json({"reqId": "req-1"})      # still solving
             return
         answer = _solution_for(type(self).posts[-1]["body"], type(self).keys)
         if type(self).mangle is not None:
@@ -140,7 +140,7 @@ class FakeCuOpt(http.server.BaseHTTPRequestHandler):
         if not type(self).trickle_s:
             self.wfile.write(data)
             return
-        # 읽기 한 번마다 새로 재는 timeout 은 이런 답을 끊지 못합니다.
+        # A timeout that restarts on every read cannot cut off an answer like this.
         for index in range(len(data)):
             time.sleep(type(self).trickle_s)
             try:
@@ -162,7 +162,7 @@ class CuOptDispatchTest(unittest.TestCase):
         threading.Thread(target=self.server.serve_forever, daemon=True).start()
         self.url = f"http://127.0.0.1:{self.server.server_address[1]}"
         self.world = Simulation(seed=7).worlds["guarded"]
-        for vehicle in self.world.vehicles.values():   # 주문 없는 기단에서 시작합니다
+        for vehicle in self.world.vehicles.values():   # start from a fleet with no orders
             vehicle.job_label, vehicle.job_x, vehicle.job_y = "", None, None
 
     def tearDown(self):
@@ -182,12 +182,13 @@ class CuOptDispatchTest(unittest.TestCase):
                                         "task_data", "travel_time_matrix_data"])
         fleet, tasks = body["fleet_data"], body["task_data"]
         self.assertEqual(fleet["vehicle_ids"], sorted(self.world.vehicles))
-        # 한 기체의 적재량 = 이번에 들를 곳 수 × 한 곳에 내리는 상자 수. 짐이 딱 맞아야 모든 주문이
-        # 배달되고, 남으면 솔버가 한 기체에 몰아줍니다.
+        # One aircraft's capacity = stops this trip × parcels dropped per stop. The load must
+        # fit exactly for every order to be delivered; with room to spare the solver piles
+        # them onto one aircraft.
         self.assertEqual(fleet["capacities"],
                          [[STOPS_PER_TRIP * PARCELS_PER_STOP] * len(self.world.vehicles)])
         self.assertTrue(all(pair[1] == 0 for pair in fleet["vehicle_locations"]),
-                        "한 바퀴는 창고(0번 자리)에서 끝납니다")
+                        "a loop ends at the depot (location 0)")
         self.assertEqual(len(tasks["task_ids"]), STOPS_PER_TRIP * len(self.world.vehicles))
         self.assertEqual(tasks["demand"], [[PARCELS_PER_STOP] * len(tasks["task_ids"])])
         matrix = body["cost_matrix_data"]["data"]["0"]
@@ -203,7 +204,7 @@ class CuOptDispatchTest(unittest.TestCase):
         drone.job_label = first["name"]
         self.assertGreaterEqual(len(FakeCuOpt.gets), 3)
         self.assertTrue(FakeCuOpt.gets[0].startswith("/cuopt/solution/req-1"))
-        # 두 번째 정차는 이미 받아 둔 계획에서 나옵니다 — 다시 풀지 않습니다.
+        # The second stop comes from the plan already in hand — no second solve.
         second = dispatcher.next_stop(self.world, drone)
         self.assertEqual(len(FakeCuOpt.posts), 1)
         self.assertNotEqual(second["name"], first["name"])
@@ -223,13 +224,14 @@ class CuOptDispatchTest(unittest.TestCase):
         for vehicle in self.world.vehicles.values():
             area = dispatcher.next_stop(self.world, vehicle)
             vehicle.job_label = area["name"]
-        self.assertEqual(len(FakeCuOpt.posts), 1, "기단 전체를 한 번에 짭니다")
+        self.assertEqual(len(FakeCuOpt.posts), 1, "plans the whole fleet in one go")
         labels = [vehicle.job_label for vehicle in self.world.vehicles.values()]
-        self.assertEqual(len(set(labels)), len(labels), "한 착륙장에 두 대를 보내지 않습니다")
+        self.assertEqual(len(set(labels)), len(labels),
+                         "never sends two aircraft to one landing site")
 
 
 class CuOptFallsBackTest(unittest.TestCase):
-    """cuOpt 가 어떻게 어긋나든 그 정차는 규칙이 정하고 세계는 계속 돕니다."""
+    """However cuOpt goes wrong, the rule picks that stop and the world keeps running."""
 
     def setUp(self):
         FakeCuOpt.posts, FakeCuOpt.gets = [], []
@@ -254,7 +256,7 @@ class CuOptFallsBackTest(unittest.TestCase):
 
     def test_a_server_that_is_not_there(self):
         dispatcher = CuOptDispatcher("http://127.0.0.1:9", timeout_s=1.0)
-        self._falls_back(dispatcher, "닿지 않는 서버")
+        self._falls_back(dispatcher, "unreachable server")
         self.assertIn("cuopt/request", dispatcher.stats["last_error"])
 
     def test_a_server_that_answers_500(self):
@@ -264,17 +266,17 @@ class CuOptFallsBackTest(unittest.TestCase):
     def test_a_solve_that_never_finishes_inside_the_budget(self):
         FakeCuOpt.polls_pending = 10_000
         dispatcher = CuOptDispatcher(self.url, timeout_s=0.5)
-        self._falls_back(dispatcher, "시간 안에 안 풀림")
+        self._falls_back(dispatcher, "not solved in time")
         self.assertIn("did not answer", dispatcher.stats["last_error"])
 
     def test_an_answer_trickled_a_byte_at_a_time_cannot_hold_the_world(self):
-        """urllib 의 timeout 은 읽기 한 번마다라서, 한 바이트씩 흘리는 답은 예산의 몇 배를
-        붙잡았습니다(실측: 2초 예산에 21~30초). 세계 스레드는 예산만큼만 기다리고 규칙으로
-        갑니다."""
+        """urllib's timeout is per read, so an answer trickled a byte at a time held on for
+        several times the budget (measured: 21~30 s on a 2 s budget). The world thread waits
+        only as long as the budget, then goes to the rule."""
         FakeCuOpt.trickle_s = 0.2
         dispatcher = CuOptDispatcher(self.url, timeout_s=0.5)
         started = time.monotonic()
-        self._falls_back(dispatcher, "한 바이트씩 흘리는 답")
+        self._falls_back(dispatcher, "answer trickled a byte at a time")
         self.assertLess(time.monotonic() - started, 1.5)
         self.assertIn("did not answer", dispatcher.stats["last_error"])
 
@@ -297,12 +299,12 @@ class CuOptFallsBackTest(unittest.TestCase):
 
         FakeCuOpt.mangle = staticmethod(broken)
         dispatcher = CuOptDispatcher(self.url, timeout_s=2.0)
-        self._falls_back(dispatcher, "모르는 과제")
+        self._falls_back(dispatcher, "unknown task")
         self.assertIn("la-mars", dispatcher.stats["last_error"])
 
     def test_garbage_instead_of_a_solution(self):
         FakeCuOpt.mangle = staticmethod(lambda answer: {"response": {"nonsense": True}})
-        self._falls_back(CuOptDispatcher(self.url, timeout_s=2.0), "답이 답이 아님")
+        self._falls_back(CuOptDispatcher(self.url, timeout_s=2.0), "the answer is not an answer")
 
     def test_after_a_failure_it_backs_off_instead_of_stalling_every_stop(self):
         FakeCuOpt.post_status = 500
@@ -312,7 +314,7 @@ class CuOptFallsBackTest(unittest.TestCase):
         posted = len(FakeCuOpt.posts)
         for _ in range(3):
             self.assertIsNotNone(dispatcher.next_stop(self.world, drone))
-        self.assertEqual(len(FakeCuOpt.posts), posted, "물러선 동안에는 묻지 않습니다")
+        self.assertEqual(len(FakeCuOpt.posts), posted, "does not ask while backed off")
         self.assertEqual(dispatcher.stats["fell_back"], 4)
 
 
@@ -336,14 +338,15 @@ class WhichDispatcherTest(unittest.TestCase):
         self.assertIs(guarded, dispatcher_for(simulation.worlds["guarded"]))
 
     def test_the_runtime_knows_nothing_about_dispatch(self):
-        """배차는 운영사의 일입니다. 런타임 파일이 이 이름들을 알면 그 경계가 무너진 것입니다."""
+        """Dispatch is the operator's job. If a runtime file knows these names, that boundary
+        has fallen."""
         import pathlib
-        runtime = pathlib.Path(__file__).resolve().parent.parent / "holdshort" / "runtime"
+        runtime = pathlib.Path(__file__).resolve().parent.parent / "backend"
         for path in runtime.rglob("*.py"):
             text = path.read_text(encoding="utf-8")
             for word in ("sim.dispatch", "dispatcher_for", "Dispatcher", "cuopt", "cuOpt",
                          "CUOPT"):
-                self.assertNotIn(word, text, f"{path.name} 이 배차를 압니다")
+                self.assertNotIn(word, text, f"{path.name} knows about dispatch")
 
 
 if __name__ == "__main__":

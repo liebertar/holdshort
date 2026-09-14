@@ -3,12 +3,12 @@ import time
 import unittest
 from unittest import mock
 
-from holdshort.core.models import Proposal, Verdict
-from holdshort.llm.client import LlmReply, TieredLlm
-from holdshort.runtime import service as service_module
-from holdshort.runtime.arbiter import SYSTEM, Arbiter, by_rule, parse_verdict
-from holdshort.runtime.locks import LockTable
-from holdshort.runtime.service import Runtime
+from backend.runtime import world as world_module
+from backend.runtime.arbiter import SYSTEM, Arbiter, by_rule, parse_verdict
+from backend.runtime.locks import LockTable
+from backend.runtime.tower import Runtime
+from shared.llm.client import LlmReply, TieredLlm
+from shared.models import Proposal, Verdict
 
 
 class StubLlm(TieredLlm):
@@ -68,20 +68,20 @@ class ArbiterTest(unittest.TestCase):
         self.assertTrue(how.startswith("ultra:"))
 
     def test_out_of_range_answer_is_discarded(self):
-        arbiter = Arbiter(StubLlm("저는 7번이 좋다고 생각합니다"))
+        arbiter = Arbiter(StubLlm("I think number 7 is the best one"))
         candidates = [make("drone-01", "passenger"), make("drone-02", "cargo")]
         winner, how = arbiter.choose(candidates, self.telemetry)
-        self.assertEqual(winner.asset_id, "drone-01")  # 규칙으로 되돌아갑니다
+        self.assertEqual(winner.asset_id, "drone-01")  # falls back to the rule
         self.assertTrue(how.startswith("rule:"))
 
     def test_prose_answer_is_discarded(self):
-        arbiter = Arbiter(StubLlm("둘 다 착륙시키고 새 패드를 하나 더 지으세요"))
+        arbiter = Arbiter(StubLlm("land them both and build one more pad"))
         candidates = [make("drone-01", "passenger"), make("drone-02", "cargo")]
         _, how = arbiter.choose(candidates, self.telemetry)
         self.assertTrue(how.startswith("rule:"))
 
     def test_prose_with_a_number_inside_is_still_prose(self):
-        arbiter = Arbiter(StubLlm("1번은 안 되고 2번이 낫겠습니다"))
+        arbiter = Arbiter(StubLlm("not 1, 2 would be better"))
         candidates = [make("drone-01", "passenger"), make("drone-02", "cargo")]
         _, how = arbiter.choose(candidates, self.telemetry)
         self.assertTrue(how.startswith("rule:"))
@@ -98,7 +98,8 @@ class ArbiterTest(unittest.TestCase):
         self.assertTrue(json_object)
         self.assertEqual(max_tokens, 160)
         for word in ("budget", "cost", "$", "usd"):
-            self.assertNotIn(word, (system + user).lower(), f"중재 프롬프트에 돈 이야기: {word}")
+            self.assertNotIn(word, (system + user).lower(),
+                             f"money talk in the arbiter prompt: {word}")
 
     def test_a_long_reason_is_cut_to_140(self):
         arbiter = Arbiter(StubLlm('{"choice": 1, "reason": "' + "x" * 500 + '"}'))
@@ -125,7 +126,7 @@ class ArbiterTest(unittest.TestCase):
 
 
 class TickingAdapter:
-    """세계의 시계만 흉내 냅니다. 부를 때마다 한 틱."""
+    """Mimics only the world's clock. One tick per call."""
 
     def __init__(self):
         self.n = 0
@@ -142,10 +143,11 @@ class TickingAdapter:
 
 
 class SlowArbiterDoesNotStallTheWorldTest(unittest.TestCase):
-    """Ultra 가 3초 생각하는 동안에도 틱은 흘러야 합니다.
+    """Ticks must keep flowing while Ultra thinks for 3 seconds.
 
-    중재와 세계 갱신이 한 스레드에 있던 때는 모델이 답할 때까지 런타임이 옛 위치로
-    판정했습니다. 중재는 자기 스레드에서 돌고, 그동안 _pull_world 는 계속 돕니다.
+    When arbitration and the world update shared one thread, the runtime judged on stale
+    positions until the model answered. Arbitration runs on its own thread, and _pull_world
+    keeps running meanwhile.
     """
 
     def test_a_three_second_arbiter_leaves_the_tick_running(self):
@@ -163,15 +165,17 @@ class SlowArbiterDoesNotStallTheWorldTest(unittest.TestCase):
         self.assertIs(first.verdict, Verdict.QUEUED)
         self.assertIs(second.verdict, Verdict.QUEUED)
 
-        # 시뮬레이터 HTTP 는 없습니다. 공역·공지 조회는 빈 답으로 막고 어댑터의 시계만 씁니다.
-        with mock.patch.object(service_module, "get_json", lambda *a, **k: {}):
+        # No simulator HTTP here. Airspace and notice lookups get empty answers, and only the
+        # adapter's clock is used.
+        with mock.patch.object(world_module, "get_json", lambda *a, **k: {}):
             runtime.start_background()
             time.sleep(1.5)
             ticks_while_thinking = runtime.tick
             time.sleep(2.5)
-        # 0.25초마다 한 틱이면 1.5초에 대여섯 틱. 중재 뒤에 묶여 있었다면 0~1틱입니다.
+        # One tick per 0.25 s makes five or six ticks in 1.5 s. Tied up behind arbitration it
+        # would be 0~1 ticks.
         self.assertGreaterEqual(ticks_while_thinking, 4,
-                                "중재가 끝날 때까지 세계 갱신이 멈춰 있었습니다")
+                                "the world update stalled until arbitration finished")
         self.assertEqual(adapter.executed, [("drone-02", "reserve_pad")])
         self.assertEqual(second.detail.get("arbiter_reason"), "lower battery lands first")
         self.assertEqual(second.arbiter, "ultra:stub-ultra")

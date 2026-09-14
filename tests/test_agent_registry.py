@@ -13,14 +13,14 @@ import threading
 import time
 import unittest
 
-from holdshort.agent.chooser import Choice
-from holdshort.agent.loop import GuardedAgent, ModelHealth, Registration, identity
-from holdshort.agent.propose import Proposer
-from holdshort.agent.trace import form_part
-from holdshort.core.config import model_display
-from holdshort.llm.client import TieredLlm
-from holdshort.runtime import service as service_module
-from holdshort.runtime.service import Runtime
+from backend.runtime import agents as agents_module
+from backend.runtime.tower import Runtime
+from drone.agent.chooser import Choice
+from drone.agent.loop import GuardedAgent, ModelHealth, Registration, identity
+from drone.agent.propose import Proposer
+from drone.agent.trace import form_part
+from shared.config import model_display
+from shared.llm.client import TieredLlm
 from sim.world import Simulation
 
 CONFIG = "configs/fleet.yaml"
@@ -31,7 +31,7 @@ def make_runtime() -> Runtime:
     with tempfile.NamedTemporaryFile(suffix=".jsonl", delete=False) as handle:
         runtime = Runtime(CONFIG, "http://unused", handle.name, 0.0)
     runtime.tick = 100
-    # 편대 명단은 세계(텔레메트리)가 줍니다. 등록은 명단 안의 기체만 받습니다.
+    # The world (telemetry) supplies the fleet roster. Registration accepts only aircraft on it.
     runtime.telemetry = {asset: {"lat": 40.70, "lon": -73.97, "alt_m": 0.0} for asset in FLEET}
     return runtime
 
@@ -42,7 +42,8 @@ def agent(asset: str = "drone-01", **fields) -> dict:
 
 
 def llm(base_url: str, nano: str, api_key: str = "") -> TieredLlm:
-    """환경 변수와 무관한 클라이언트. 비운 값이 환경에서 채워지지 않게 만든 뒤에 덮습니다."""
+    """A client that ignores the environment. Fields are overwritten after construction so
+    empty values are not filled in from the environment."""
     client = TieredLlm(base_url=base_url or "http://placeholder", models={"nano": nano})
     client.base_url, client.api_key = base_url, api_key
     return client
@@ -91,12 +92,12 @@ class RegistryTest(unittest.TestCase):
     def test_a_silent_agent_drops_after_the_stale_window_and_a_fresh_one_stays(self):
         self.runtime.register_agent(agent("drone-01"))
         self.runtime.register_agent(agent("drone-02"))
-        self.runtime.tick = 100 + service_module.AGENT_STALE_TICKS
+        self.runtime.tick = 100 + agents_module.AGENT_STALE_TICKS
         self.assertEqual(set(self.runtime.snapshot()["agents"]), {"drone-01", "drone-02"})
         self.runtime.register_agent(agent("drone-02"))
         self.runtime.tick += 1
         self.assertEqual(set(self.runtime.snapshot()["agents"]), {"drone-02"},
-                         "죽은 프로세스의 모델 이름을 화면이 계속 달면 거짓말입니다")
+                         "a screen still showing a dead process's model name is lying")
         self.runtime.register_agent(agent("drone-01"))
         self.assertEqual(set(self.runtime.snapshot()["agents"]), {"drone-01", "drone-02"})
 
@@ -107,8 +108,8 @@ class RegistryTest(unittest.TestCase):
         self.runtime.tick = 3
         self.runtime._follow_round(1)
         self.assertEqual(self.runtime.snapshot()["agents"]["drone-01"]["last_seen_tick"], 3,
-                         "프로세스는 그대로 — 판이 바뀌었다고 등록이 사라지지 않습니다")
-        self.runtime.tick = 3 + service_module.AGENT_STALE_TICKS + 1
+                         "the process lives on — a new round does not drop its registration")
+        self.runtime.tick = 3 + agents_module.AGENT_STALE_TICKS + 1
         self.assertEqual(self.runtime.snapshot()["agents"], {})
 
 
@@ -118,7 +119,7 @@ class RegistryTest(unittest.TestCase):
         self.runtime.telemetry = {}
         status, body = self.runtime.register_agent(agent("drone-01"))
         self.assertEqual((status, body.get("retry")), (503, True),
-                         "세계를 받기 전에는 명단을 모릅니다 — 기체는 몇 초 뒤에 다시 알립니다")
+                         "no roster until the world arrives — the aircraft retries within seconds")
         self.assertEqual(self.runtime.snapshot()["agents"], {})
 
     def test_a_model_that_stopped_answering_is_labelled_rules_and_keeps_its_id(self):
@@ -141,7 +142,7 @@ class IdentityTest(unittest.TestCase):
                          ("nvidia/Nemotron-3_5-Lightning", "nebius", 443))
 
     def test_a_model_it_cannot_call_is_not_claimed(self):
-        # 키 없는 Nebius: 모든 호출이 401 이고 신청서는 규칙이 씁니다.
+        # Nebius without a key: every call is a 401 and the rules write the filings.
         keyless = identity("drone-01", llm("https://api.tokenfactory.nebius.com/v1",
                                            "nvidia/Nemotron-3_5-Lightning"))
         no_server = identity("drone-01", llm("", "nemotron-3-nano:4b"))
@@ -163,13 +164,13 @@ class ModelHealthTest(unittest.TestCase):
     def test_answered_since_the_last_registration_is_true_and_all_missed_is_false(self):
         counts = [0, 0]
         health = ModelHealth(lambda: tuple(counts))
-        self.assertIsNone(health.check(), "아직 물은 적이 없으면 모릅니다")
+        self.assertIsNone(health.check(), "nothing asked yet, so unknown")
         counts[1] += 2
-        self.assertIs(health.check(), False, "물은 것을 전부 규칙이 대신 썼습니다")
-        self.assertIs(health.check(), False, "그 사이에 물은 적이 없으면 지난 판단 그대로")
+        self.assertIs(health.check(), False, "the rules wrote everything that was asked")
+        self.assertIs(health.check(), False, "nothing asked since, so the last reading stands")
         counts[1] += 3
         counts[0] += 1
-        self.assertIs(health.check(), True, "하나라도 모델의 답을 썼으면 모델이 쓴 것입니다")
+        self.assertIs(health.check(), True, "one used model answer means the model wrote it")
 
     def test_forms_and_choices_count_and_route_drafts_do_not(self):
         client = llm("http://127.0.0.1:9/v1", "nemotron-3-nano:4b")
@@ -180,14 +181,14 @@ class ModelHealthTest(unittest.TestCase):
         self.assertIs(health.check(), True)
         client.stats["nano"].fallback += 5
         self.assertIs(health.check(), True,
-                      "초안 실패(마지막 수단)만 쌓였다고 화면이 rules 가 되면 안 됩니다")
+                      "failed drafts (the last resort) alone must not flip the screen to rules")
         agent._count_form(form_part("", "delivery", "fly_route", "go", 6000, False, "timeout"))
         agent._count_choice(Choice("a", "rules: the shortest legal route", path="rules",
                                    asked=True, fallback_reason="timeout"))
-        self.assertIs(health.check(), False, "물었지만 규칙이 썼습니다")
+        self.assertIs(health.check(), False, "asked, but the rules wrote it")
         agent._count_form(form_part("", "delivery", "fly_route", "go", 0, False, "no model"))
         agent._count_choice(Choice("a", "rules: the shortest legal route", path="rules"))
-        self.assertIs(health.check(), False, "묻지 않은 것은 세지 않아 지난 판단 그대로")
+        self.assertIs(health.check(), False, "unasked ones don't count, so the last reading stands")
         agent._count_choice(Choice("c", "clear of traffic", model="nemotron-3-nano:4b",
                                    path="tools", asked=True))
         self.assertIs(health.check(), True)
@@ -231,7 +232,7 @@ class RegistrationTest(unittest.TestCase):
         self.assertTrue(registration.maybe_send(now=31.0))
         self.assertEqual([b["path"] for b in FakeRuntime.bodies], ["/agents/register"] * 2)
         self.assertEqual([b["model_ok"] for b in FakeRuntime.bodies], [None, True],
-                         "보낼 때마다 새로 묻습니다 — 모델이 요즘 답하는지는 바뀝니다")
+                         "asks afresh on every send — whether the model is answering changes")
 
     def test_a_missing_runtime_is_tried_again_within_seconds(self):
         self.server.shutdown()
@@ -240,9 +241,9 @@ class RegistrationTest(unittest.TestCase):
         registration = Registration(self.url, agent, period_s=30.0, retry_s=3.0)
         self.assertTrue(registration.maybe_send(now=0.0))
         self.assertFalse(registration.accepted,
-                         "런타임이 없으면 등록은 실패하고, 기체는 계속 납니다")
+                         "with no runtime the registration fails and the aircraft keeps flying")
         self.assertFalse(registration.maybe_send(now=2.0))
-        self.assertTrue(registration.maybe_send(now=3.0), "반 분이 아니라 몇 초 뒤에 다시")
+        self.assertTrue(registration.maybe_send(now=3.0), "again in seconds, not half a minute")
 
     def test_it_runs_on_its_own_thread_and_stops(self):
         registration = Registration(self.url, agent, period_s=30.0, retry_s=0.05)
@@ -253,7 +254,7 @@ class RegistrationTest(unittest.TestCase):
         registration.stop()
         thread.join(timeout=2.0)
         self.assertFalse(thread.is_alive())
-        self.assertEqual(len(FakeRuntime.bodies), 1, "받아들여지면 다음은 30초 뒤")
+        self.assertEqual(len(FakeRuntime.bodies), 1, "once accepted, the next one is 30 s later")
 
 
 class DirectModelTest(unittest.TestCase):
@@ -263,11 +264,11 @@ class DirectModelTest(unittest.TestCase):
         guarded = simulation.worlds["guarded"].snapshot(0)["assets"]
         self.assertEqual({v["agent_model"] for v in direct.values()}, {"nemotron-3-nano:4b"})
         self.assertTrue(all("agent_model" not in v for v in guarded.values()),
-                        "런타임 세계의 모델은 런타임의 /state.agents 가 압니다")
+                        "in the guarded wiring the runtime's /state.agents knows the model")
         simulation.reset()
         self.assertEqual({v["agent_model"] for v in
                           simulation.worlds["direct"].snapshot(0)["assets"].values()},
-                         {"nemotron-3-nano:4b"}, "판이 바뀌어도 같은 에이전트입니다")
+                         {"nemotron-3-nano:4b"}, "a new round is still the same agent")
 
     def test_rules_is_an_empty_id_and_unknown_is_no_field(self):
         rules = Simulation(seed=7, direct_model="").worlds["direct"].snapshot(0)["assets"]

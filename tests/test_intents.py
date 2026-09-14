@@ -10,20 +10,7 @@ import math
 import tempfile
 import unittest
 
-from holdshort.core.config import load as config_load
-from holdshort.core.geo import (
-    METRES_PER_DEG_LAT,
-    METRES_PER_DEG_LON,
-    TRAFFIC_LATERAL_M,
-    TRAFFIC_VERTICAL_M,
-    Airspace,
-    Volume,
-    box,
-    first_breach,
-    vertical_column,
-)
-from holdshort.core.models import Proposal, Verdict
-from holdshort.runtime.intents import (
+from backend.runtime.intents import (
     ACCEPTED,
     ACTIVATED,
     CONTINGENCY,
@@ -36,11 +23,24 @@ from holdshort.runtime.intents import (
     first_conflict,
     schedule,
 )
-from holdshort.runtime.service import Runtime
+from backend.runtime.tower import Runtime
+from shared.config import load as config_load
+from shared.geo import (
+    METRES_PER_DEG_LAT,
+    METRES_PER_DEG_LON,
+    TRAFFIC_LATERAL_M,
+    TRAFFIC_VERTICAL_M,
+    Airspace,
+    Volume,
+    box,
+    first_breach,
+    vertical_column,
+)
+from shared.models import Proposal, Verdict
 from sim import world as sim_world
 
 CONFIG = "configs/fleet.yaml"
-# 합성 하늘의 원점. 맨해튼 위도라 미터 환산이 실제와 같습니다.
+# Origin of the synthetic sky. At Manhattan's latitude, so metre conversions match reality.
 LAT0, LON0 = 40.7000, -73.9700
 
 
@@ -59,17 +59,17 @@ def leg(north_m: float, east_m: float, alt_m: float) -> dict:
 
 def route(asset: str, legs: list[dict], **params) -> dict:
     return Proposal(asset_id=asset, action="fly_route", cost_usd=12.0, blast_radius="schedule",
-                    rationale="시험", params={"legs": legs, **params}).to_dict()
+                    rationale="test", params={"legs": legs, **params}).to_dict()
 
 
 class RecordingAdapter:
-    """실행된 것을 셉니다. 런타임의 보장은 여기 닿는 것으로 재야 합니다."""
+    """Counts what was executed. The runtime's guarantees must be measured by what reaches here."""
 
     def __init__(self):
         self.sent = []
 
     def execute(self, asset_id, action, params, ledger_id, blast="none", approved_by=None):
-        json.dumps(params)   # HTTP 어댑터처럼 JSON 이어야 합니다
+        json.dumps(params)   # must be JSON, as with the HTTP adapter
         self.sent.append((asset_id, action, params, ledger_id))
         return {"ok": True}
 
@@ -95,24 +95,26 @@ def make_runtime(volumes=()) -> tuple[Runtime, RecordingAdapter]:
 
 
 def ledger_lines(runtime: Runtime) -> list[dict]:
-    """닫힌 항목만. 원장은 열 때 한 줄, 닫을 때 한 줄이라 같은 id 가 두 번 나옵니다."""
+    """Closed entries only. The ledger writes a line on open and one on close, so each id
+    appears twice."""
     with open(runtime.ledger.path, encoding="utf-8") as handle:
         return [entry for entry in (json.loads(line) for line in handle)
                 if entry["outcome"] != "pending"]
 
 
-# ---------- C1. 수직 구간 ----------
+# ---------- C1. Vertical legs ----------
 
 
 class VerticalColumnTest(unittest.TestCase):
-    """출발점 옆 건물은 순항 구간을 안 막아도 이륙 기둥은 막습니다."""
+    """A building beside the start blocks the takeoff column even when the cruise leg is clear."""
 
     def setUp(self):
-        # 출발점에서 동쪽 5m 에 옥상 60m 건물. 이격 50m 까지 막으니 0~110m 가 그 건물입니다.
-        self.building = Volume("bldg-next-door", "옆 건물",
+        # A building with a 60 m roof, 5 m east of the start. It blocks up to the 50 m margin,
+        # so 0~110 m is that building.
+        self.building = Volume("bldg-next-door", "next-door building",
                                box(LAT0 - north(10), LON0 + east(5), LAT0 + north(10),
                                    LON0 + east(40)),
-                               ceiling_m=60.0, clearance_m=50.0, source="시험")
+                               ceiling_m=60.0, clearance_m=50.0, source="test")
         self.runtime, self.adapter = make_runtime([self.building])
         self.runtime.telemetry = {"drone-01": ground(0, 0)}
 
@@ -124,13 +126,14 @@ class VerticalColumnTest(unittest.TestCase):
         found = first_breach(Airspace([self.building]), column)
         self.assertIsNotNone(found)
         self.assertEqual(found[1].id, "bldg-next-door")
-        # 건물 띠 위에서 시작하는 기둥은 통과합니다
+        # A column that starts above the building's band passes
         self.assertIsNone(first_breach(Airspace([self.building]),
                                        vertical_column(LAT0, LON0, 111.0, 120.0)))
 
     def test_the_cruise_leg_passes_but_the_takeoff_column_is_refused(self):
         legs = [leg(0, 0, 115.0), leg(600, 0, 115.0)]
-        self.assertIsNone(first_breach(self.runtime.airspace, legs), "순항 구간은 옥상 위입니다")
+        self.assertIsNone(first_breach(self.runtime.airspace, legs),
+                          "the cruise leg is above the roof")
         decision = self.runtime.file(route("drone-01", legs))
         self.assertIs(decision.verdict, Verdict.DENIED)
         self.assertEqual(decision.code, "airspace")
@@ -142,15 +145,16 @@ class VerticalColumnTest(unittest.TestCase):
         self.assertEqual(params["blocked_leg"], 1)
         self.assertAlmostEqual(params["blocked_at"]["lat"], LAT0, places=5)
         self.assertEqual(params["blocked_ceiling_m"], 60.0)
-        self.assertIn("이륙 기둥", decision.reason)
+        self.assertIn("takeoff column", decision.reason)
         self.assertEqual(self.adapter.sent, [])
 
     def test_a_vertex_climb_through_a_band_neither_leg_touches_is_refused(self):
-        # 꼭짓점 위에만 걸린 50~80m 띠. 앞 구간은 40m(아래), 뒤 구간은 100m(위)라 둘 다 통과인데
-        # 꼭짓점에서 40 → 100 으로 오르는 동안 띠를 지납니다.
-        band = Volume("nofly-band", "띠", box(LAT0 + north(290), LON0 - east(20),
+        # A 50~80 m band sitting only over the vertex. The first leg is at 40 m (below) and the
+        # second at 100 m (above), so both pass, but the climb from 40 → 100 at the vertex
+        # goes through the band.
+        band = Volume("nofly-band", "band", box(LAT0 + north(290), LON0 - east(20),
                                               LAT0 + north(310), LON0 + east(20)),
-                      floor_m=50.0, ceiling_m=80.0, source="시험")
+                      floor_m=50.0, ceiling_m=80.0, source="test")
         runtime, adapter = make_runtime([band])
         runtime.telemetry = {"drone-01": ground(0, 0)}
         legs = [leg(0, 0, 40.0), leg(300, 0, 40.0), leg(600, 0, 100.0)]
@@ -175,7 +179,8 @@ class VerticalColumnTest(unittest.TestCase):
 
     def test_an_airborne_refile_climbs_from_where_it_is_not_from_the_ground(self):
         runtime, adapter = make_runtime([self.building])
-        # 떠 있는 기체는 지금 고도(112m, 옥상 띠 위)에서 첫 구간 고도까지가 기둥입니다.
+        # For an airborne aircraft, the column runs from its current altitude (112 m, above the
+        # roof band) to the first leg's altitude.
         runtime.telemetry = {"drone-01": {**ground(0, 0), "alt_m": 112.0, "state": "cruising"}}
         decision = runtime.file(route("drone-01", [leg(0, 0, 115.0), leg(600, 0, 115.0)]))
         self.assertIs(decision.verdict, Verdict.AUTO, decision.reason)
@@ -183,10 +188,10 @@ class VerticalColumnTest(unittest.TestCase):
         self.assertEqual(adapter.sent[0][1], "fly_route")
 
     def test_an_airborne_descent_through_a_band_is_refused_unless_already_inside_it(self):
-        # 출발점 위에만 걸린 50~80m 띠. 112m 에서 40m 로 내려오는 기둥이 띠를 지납니다.
-        band = Volume("nofly-band", "띠", box(LAT0 - north(10), LON0 - east(20),
+        # A 50~80 m band only over the start. The column down from 112 m to 40 m crosses it.
+        band = Volume("nofly-band", "band", box(LAT0 - north(10), LON0 - east(20),
                                               LAT0 + north(10), LON0 + east(20)),
-                      floor_m=50.0, ceiling_m=80.0, source="시험")
+                      floor_m=50.0, ceiling_m=80.0, source="test")
         runtime, adapter = make_runtime([band])
         runtime.telemetry = {"drone-01": {**ground(0, 0), "alt_m": 112.0, "state": "cruising"}}
         legs = [leg(0, 0, 40.0), leg(600, 0, 40.0)]
@@ -195,8 +200,8 @@ class VerticalColumnTest(unittest.TestCase):
         params = ledger_lines(runtime)[-1]["proposal"]["params"]
         self.assertEqual((params["blocked_kind"], params["blocked_volume"]),
                          ("takeoff", "nofly-band"))
-        # 이미 띠 안에 있는 기체(회수돼 나온 자리)는 그 사실을 계획으로 보지 않습니다 —
-        # 내려올 길은 내야 합니다.
+        # An aircraft already inside the band (where a recall left it) is not judged as planning
+        # to be there — it has to be able to file its way down.
         runtime.telemetry = {"drone-01": {**ground(0, 0), "alt_m": 60.0, "state": "cruising"}}
         decision = runtime.file(route("drone-01", legs))
         self.assertTrue(decision.committed, decision.reason)
@@ -209,7 +214,7 @@ class VerticalColumnTest(unittest.TestCase):
         self.assertEqual(context["checks_run"], ["dedupe", "form", "endpoints", "route", "columns"])
 
 
-# ---------- C2. 의도(4D) ----------
+# ---------- C2. Intents (4D) ----------
 
 
 class ScheduleTest(unittest.TestCase):
@@ -217,18 +222,19 @@ class ScheduleTest(unittest.TestCase):
         self.performance = config_load(CONFIG).performance
 
     def test_declared_performance_matches_the_simulator(self):
-        """런타임이 셈하는 시간과 시뮬레이터가 나는 시간이 같은 숫자여야 합니다."""
+        """The times the runtime computes and the simulator flies must be the same numbers."""
         self.assertEqual(self.performance.cruise_mps, sim_world.CRUISE_MPS)
         self.assertEqual(self.performance.climb_mps, sim_world.CLIMB_MPS)
         self.assertEqual(self.performance.descent_mps, sim_world.DESCENT_MPS)
         self.assertEqual(self.performance.seconds_per_tick, sim_world.SIM_SECONDS_PER_TICK)
         self.assertEqual(self.performance.clearance_ticks, sim_world.CLEARANCE_TICKS)
         self.assertEqual(self.performance.clock_epoch_z, sim_world.CLOCK.epoch_z)
-        # 항법 오차는 시뮬레이터가 모서리를 자르는 만큼(경유점 반경)보다 커야 합니다.
+        # Navigation tolerance must exceed how far the simulator cuts corners (waypoint radius).
         self.assertGreaterEqual(self.performance.nav_tolerance_m, sim_world.ARRIVAL_RADIUS_M)
-        # 자리는 창고 옥상 위 22 m 간격입니다. 옆자리는 회랑(40 m) 안이라 같은 틱에 뜨면 이륙 기둥이
-        # 겹치고, 그때는 런타임이 한 대를 기다리게 합니다(위 TakeoffColumn·delay 시험). 자리끼리는
-        # 최소한 항법 오차 두 배는 떨어져 있어야 앉은 기체끼리 겹쳐 보이지 않습니다.
+        # Seats are 22 m apart on the depot roof. The next seat is inside the corridor (40 m), so
+        # two lifting off on the same tick overlap takeoff columns, and the runtime then holds one
+        # of them (the TakeoffColumn/delay tests above). Seats must be at least twice the
+        # navigation tolerance apart, or parked aircraft appear to overlap.
         seat0 = sim_world.to_latlon(*sim_world.seat_of(0))
         seat1 = sim_world.to_latlon(*sim_world.seat_of(1))
         spacing = math.hypot((seat1[1] - seat0[1]) * math.cos(math.radians(seat0[0])),
@@ -236,8 +242,9 @@ class ScheduleTest(unittest.TestCase):
         self.assertGreaterEqual(spacing, 2 * self.performance.nav_tolerance_m)
 
     def test_windows_follow_climb_cruise_and_descent_in_order(self):
-        # 0 → 40m 상승(1.6m/틱 → 25틱), 870m 순항(17.6m/틱 → 50틱), 40 → 100m 상승(38틱),
-        # 170m 순항(10틱), 100 → 0 하강(1.4m/틱 → 72틱)
+        # 0 → 40 m climb (1.6 m/tick → 25 ticks), 870 m cruise (17.6 m/tick → 50 ticks),
+        # 40 → 100 m climb (38 ticks), 170 m cruise (10 ticks),
+        # 100 → 0 descent (1.4 m/tick → 72 ticks)
         legs = [leg(0, 0, 40.0), leg(870, 0, 40.0), leg(1040, 0, 100.0)]
         volumes, arrive = schedule(legs, depart_tick=1000, start_alt_m=0.0,
                                    performance=self.performance)
@@ -253,7 +260,8 @@ class ScheduleTest(unittest.TestCase):
         cruise = volumes[1]
         self.assertEqual((cruise.from_tick, cruise.to_tick), (1025 - TIME_PAD_TICKS,
                                                               1075 + TIME_PAD_TICKS))
-        # 회랑은 분리 최소치 + 신고한 항법 오차(옆 10m, 위아래 한 틱의 승강 1.6m)만큼 넓습니다.
+        # The corridor is as wide as the separation minimum plus the declared navigation
+        # tolerance (10 m sideways; 1.6 m vertically, one tick of climb or descent).
         lateral, vertical = corridor_widths(self.performance)
         self.assertEqual((lateral, vertical), (TRAFFIC_LATERAL_M + 10.0, TRAFFIC_VERTICAL_M + 1.6))
         self.assertAlmostEqual(cruise.floor_m, 40 - vertical)
@@ -293,7 +301,7 @@ class RegistryTest(unittest.TestCase):
         registry.accept(intent)
         self.assertEqual(intent.state, ACCEPTED)
         registry.observe({"drone-01": {"alt_m": 0.0}}, 110)
-        self.assertEqual(intent.state, ACCEPTED, "땅에 있으면 아직 accepted")
+        self.assertEqual(intent.state, ACCEPTED, "still accepted while on the ground")
         registry.observe({"drone-01": {"alt_m": 12.0}}, 130)
         self.assertEqual(intent.state, ACTIVATED)
         registry.observe({"drone-01": {"alt_m": 0.5}}, 200)
@@ -320,11 +328,11 @@ class RegistryTest(unittest.TestCase):
         self.assertLess(row["from_tick"], row["to_tick"])
 
 
-# ---------- C3. 전략적 비충돌 ----------
+# ---------- C3. Strategic deconfliction ----------
 
 
 class StrategicConflictTest(unittest.TestCase):
-    """먼저 낸 쪽이 이깁니다. 겹치는 것은 공간과 시간이 같이 겹칠 때뿐입니다."""
+    """Whoever files first wins. Overlap means overlapping in space and time at once."""
 
     def setUp(self):
         self.runtime, self.adapter = make_runtime()
@@ -332,7 +340,7 @@ class StrategicConflictTest(unittest.TestCase):
             "drone-01": ground(0, 0), "drone-02": ground(0, 82),
             "drone-03": ground(0, 164), "drone-04": ground(0, 246),
         }
-        # 01 은 북동으로, 02 는 북서로 — 자리 60m 북쪽에서 직선이 교차합니다.
+        # 01 heads northeast, 02 northwest — their straight lines cross 60 m north of the seats.
         self.first = [leg(0, 0, 60.0), leg(1500, 1500, 60.0)]
         self.crossing = [leg(0, 82, 60.0), leg(1500, -1500, 60.0)]
 
@@ -358,7 +366,7 @@ class StrategicConflictTest(unittest.TestCase):
         self.assertIn("lat", params["blocked_at"])
         self.assertIsInstance(params["blocked_until_tick"], int)
         self.assertEqual(decision.detail["blocked_until_tick"], params["blocked_until_tick"])
-        # 교차점은 새 경로 위의 점이고, 상대 회랑(30m) 안입니다
+        # The crossing point lies on the new route, inside the other corridor (30 m)
         at = (params["blocked_at"]["lat"], params["blocked_at"]["lon"])
         other = self.runtime.intents.get("drone-01")
         self.assertTrue(any(v.contains(at[0], at[1], 60.0, v.t_enter) for v in other.volumes))
@@ -376,7 +384,7 @@ class StrategicConflictTest(unittest.TestCase):
     def test_a_centimetre_matters_but_far_enough_in_time_does_not(self):
         self.approve_first()
         other = self.runtime.intents.get("drone-01")
-        # 같은 길을 상대 의도가 끝난 뒤에 나가면 겹치지 않습니다
+        # The same path flown after the other intent ends does not overlap
         decision = self.runtime.file(route("drone-02", self.crossing, resolution="delay",
                                            holding_for="drone-01",
                                            depart_after_tick=other.to_tick))
@@ -387,21 +395,23 @@ class StrategicConflictTest(unittest.TestCase):
 
     def test_own_intents_never_block_a_refile(self):
         self.approve_first()
-        self.runtime.tick += 20   # 중복 방지 창(15틱) 밖에서 다시 냅니다
+        self.runtime.tick += 20   # refile outside the dedupe window (15 ticks)
         again = self.runtime.file(route("drone-01", [leg(0, 0, 60.0), leg(1500, -1500, 60.0)]))
         self.assertTrue(again.committed, again.reason)
-        self.assertEqual(len(self.runtime.intents.live()), 1, "새 승인이 앞 의도를 대신합니다")
+        self.assertEqual(len(self.runtime.intents.live()), 1,
+                         "the new approval replaces the earlier intent")
 
     def test_parallel_corridors_forty_metres_apart_do_not_conflict(self):
         self.approve_first()
-        # 대각선에서 동쪽으로 60m 는 수직 거리 42m 입니다(30m 회랑 밖)
+        # 60 m east of a diagonal is a perpendicular distance of 42 m (outside the 30 m corridor)
         beside = [leg(0, 60, 60.0), leg(1500, 1560, 60.0)]
         decision = self.runtime.file(route("drone-02", beside))
         self.assertTrue(decision.committed, decision.reason)
 
     def test_two_aircraft_cannot_land_on_one_site_inside_the_window(self):
-        # 01 은 틱 600 에 뜨기로 하고 자리에 서 있습니다. 회랑 부피는 570 부터만 자리를 덮지만
-        # 그 전에도 기체는 거기 있습니다 — 04 가 그 자리(10m 옆)에 틱 180 쯤 내리려 합니다.
+        # 01 is set to lift off at tick 600 and sits on its seat. Its corridor volume covers the
+        # seat only from 570, but the aircraft is there before that too — 04 tries to land on that
+        # spot (10 m away) around tick 180.
         decision = self.runtime.file(route("drone-01", self.first, depart_after_tick=600))
         self.assertTrue(decision.committed, decision.reason)
         onto_the_seat = [leg(0, 246, 60.0), leg(0, 10, 60.0)]
@@ -413,14 +423,15 @@ class StrategicConflictTest(unittest.TestCase):
         self.assertEqual(params["blocked_asset"], "drone-01")
         self.assertEqual(params["blocked_until_tick"], 600 + TIME_PAD_TICKS)
         self.assertEqual(decision.detail["blocked_kind"], "landing")
-        # 01 이 나중에 내릴 자리(20m 옆)에 03 이 먼저 내리는 것도 안 됩니다 — 01 이 올 때 03 이
-        # 거기 서 있습니다. 내린 기체는 다음 승인까지 그 자리에 있고, 그게 언제인지는 모릅니다.
+        # Nor may 03 land first where 01 will land later (20 m away) — 03 would still be there
+        # when 01 arrives. A landed aircraft stays on its spot until its next approval, and when
+        # that comes is unknown.
         arriving = [leg(0, 164, 60.0), leg(1500, 1520, 60.0)]
         decision = self.runtime.file(route("drone-03", arriving))
         self.assertIs(decision.verdict, Verdict.DENIED)
         self.assertEqual((self.last_params()["blocked_kind"], self.last_params()["blocked_asset"]),
                          ("landing", "drone-01"))
-        # 140m 옆 자리는 됩니다. 같은 무렵 그 자리로 오는 04 는 03 에 막힙니다.
+        # A spot 140 m away is fine. 04, arriving there around the same time, is blocked by 03.
         beside = [leg(0, 164, 60.0), leg(1400, 1600, 60.0)]
         self.assertTrue(self.runtime.file(route("drone-03", beside)).committed)
         same_site = [leg(0, 246, 60.0), leg(1400, 1600, 60.0)]
@@ -428,14 +439,15 @@ class StrategicConflictTest(unittest.TestCase):
         self.assertIs(decision.verdict, Verdict.DENIED)
         self.assertEqual(self.last_params()["blocked_asset"], "drone-03")
 
-    # 떠 있는 02 가 북서쪽 2km 에서 01 의 대각선 회랑을 가로질러 옵니다. 01 이 그 자리를 지날
-    # 무렵(틱 190 안팎) 02 도 거기(틱 220 안팎) 있습니다 — 01 의 구간 창 [120, 301) 안입니다.
+    # Airborne 02 comes across 01's diagonal corridor from 2 km to the northwest. Around when 01
+    # passes that spot (about tick 190), 02 is there too (about tick 220) — inside 01's leg
+    # window [120, 301).
     AIRBORNE_AT = (1500, -1400)
     ACROSS = [leg(1500, -1400, 60.0), leg(-100, 1500, 60.0)]
 
     def test_an_airborne_contingent_refile_withdraws_the_undeparted_intent(self):
         self.approve_first()
-        # 02 는 떠 있습니다(회수돼 나온 자리). 01 은 아직 안 떴습니다.
+        # 02 is airborne (where a recall left it). 01 has not lifted off yet.
         self.runtime.telemetry["drone-02"] = {**ground(*self.AIRBORNE_AT), "alt_m": 60.0,
                                               "state": "cruising"}
         decision = self.runtime.file(route("drone-02", self.ACROSS))
@@ -453,7 +465,7 @@ class StrategicConflictTest(unittest.TestCase):
         self.assertEqual(entry["decision"]["policy_hit"], "traffic")
         self.assertEqual(entry["context"]["intent_id"], first.id)
         self.assertEqual(entry["context"]["checks_run"], ["withdraw"])
-        # 물린 기체는 바로 다시 낼 수 있습니다 — 중복으로 거절되지 않습니다
+        # The withdrawn aircraft can refile at once — it is not refused as a duplicate
         again = self.runtime.file(route("drone-01", [leg(0, 0, 60.0), leg(1500, 1500, 90.0)]))
         self.assertNotEqual(again.code, "duplicate")
 
@@ -467,7 +479,7 @@ class StrategicConflictTest(unittest.TestCase):
         decision = self.runtime.file(route("drone-02", self.ACROSS))
         self.assertIs(decision.verdict, Verdict.DENIED)
         self.assertEqual(decision.policy_hit, "traffic")
-        self.assertEqual([s[1] for s in self.adapter.sent], ["fly_route"], "물린 것이 없습니다")
+        self.assertEqual([s[1] for s in self.adapter.sent], ["fly_route"], "nothing withdrawn")
 
     def test_a_recall_ends_the_route_and_leaves_only_the_hover_in_the_way(self):
         self.approve_first()
@@ -476,16 +488,17 @@ class StrategicConflictTest(unittest.TestCase):
             **ground(0, 0), "alt_m": 60.0, "state": "delivering",
             "route": [{"lat": self.first[1]["lat"], "lon": self.first[1]["lon"], "alt_m": 60.0}],
         }
-        closing = Volume("nofly-t", "닫힘", box(LAT0 + north(700), LON0 + east(600),
+        closing = Volume("nofly-t", "closing", box(LAT0 + north(700), LON0 + east(600),
                                                 LAT0 + north(900), LON0 + east(900)))
         pulled = self.runtime.recall_flights(closing)
         self.assertEqual(len(pulled), 1)
         self.assertEqual((flown.state, flown.ended_reason), (ENDED, "recalled"))
-        # 경로는 끝났지만 기체는 (0,0) 60m 에 떠 있습니다. 그 자리는 끝없는 기둥으로 남습니다.
+        # The route is over but the aircraft hovers at (0,0) at 60 m. That spot stays as an
+        # open-ended column.
         standing = self.runtime.intents.get("drone-01")
         self.assertEqual((standing.kind, standing.state), (CONTINGENCY, ACTIVATED))
         self.assertEqual(standing.to_tick, OPEN_ENDED_TICK + TIME_PAD_TICKS)
-        # 02 의 대각선은 (0,0) 에서 56m 비켜 갑니다 — 옛 회랑은 더는 막지 않습니다.
+        # 02's diagonal passes 56 m from (0,0) — the old corridor no longer blocks it.
         decision = self.runtime.file(route("drone-02", self.crossing))
         self.assertTrue(decision.committed, decision.reason)
 
@@ -505,12 +518,12 @@ class StrategicConflictTest(unittest.TestCase):
         conflict = first_conflict(volumes, [other])
         self.assertIsNotNone(conflict)
         self.assertEqual(conflict.asset, "drone-01")
-        # 새 경로의 첫 구간 위, 출발점보다 앞선 자리입니다
+        # On the new route's first leg, ahead of the start point
         self.assertGreater(conflict.at[0], LAT0)
         self.assertGreaterEqual(conflict.until_tick, conflict.tick)
 
 
-# ---------- C4. 운영사의 해결 사다리 (오프라인 하네스 = loop.py 의 거울) ----------
+# ---------- C4. The operator's resolution ladder (offline harness = mirror of loop.py) ----------
 
 
 class ResolutionLadderTest(unittest.TestCase):
@@ -521,8 +534,9 @@ class ResolutionLadderTest(unittest.TestCase):
         self.runtime.telemetry = {"drone-01": ground(0, 0), "drone-02": ground(0, 82)}
         self.runtime.pad_coords = {}
         self.side = GuardedSide(self.runtime)
-        # 운영사의 직선은 빈 하늘에서 70m(FLOOR_ALT_M)입니다. 01 도 70m 로 두면 02 의 직선이
-        # 겹치고, 30m 올린 100m 는 01 의 띠(45~95m) 밖입니다.
+        # In an empty sky the operator's straight line flies at 70 m (FLOOR_ALT_M). With 01 at
+        # 70 m too, 02's straight line overlaps, and 100 m (30 m higher) is outside 01's band
+        # (45~95 m).
         self.first = [leg(0, 0, 70.0), leg(1500, 1500, 70.0)]
         self.assertTrue(self.runtime.file(route("drone-01", self.first)).committed)
 
@@ -545,7 +559,7 @@ class ResolutionLadderTest(unittest.TestCase):
         self.assertEqual([e["decision"]["policy_hit"] for e in refused], ["traffic"])
 
     def test_delay_when_the_ceiling_leaves_no_room_above(self):
-        # 이 하늘의 천장은 100m: 70 + 30 은 넘습니다 → 출발 지연으로.
+        # This sky's ceiling is 100 m: 70 + 30 is over it → a departure delay instead.
         self.runtime.airspace.default_ceiling_m = 100.0
         self.side.planner = type(self.side.planner)(self.runtime.airspace)
         proposal = Proposal.from_dict(route("drone-02", []))
@@ -563,11 +577,12 @@ class ResolutionLadderTest(unittest.TestCase):
                          params["depart_after_tick"])
 
     def test_the_ladder_is_finite(self):
-        """고도도 지연도 안 되면 후보를 차례로 내고(후보마다 같은 사다리), 그것도 안 되면 이번
-        차례는 접습니다. 사다리는 직선 하나 + 후보마다 하나(loop.py _file_candidates)까지입니다."""
-        from holdshort.agent.loop import MAX_DELAY_TRIES
-        from holdshort.core.route import CANDIDATE_LABELS
-        from holdshort.runtime.intents import Volume4D
+        """When neither altitude nor delay works, the candidates are filed in turn (the same
+        ladder for each), and if none of those works, this turn is given up. At most one ladder
+        for the straight line plus one per candidate (loop.py _file_candidates)."""
+        from backend.runtime.intents import Volume4D
+        from drone.agent.loop import MAX_DELAY_TRIES
+        from shared.route import CANDIDATE_LABELS
 
         filings = []
         original = self.runtime.file
@@ -577,7 +592,8 @@ class ResolutionLadderTest(unittest.TestCase):
             return original(raw)
 
         self.runtime.file = counting
-        # 하늘 전부를 차례로 덮는 의도 여섯 개. 어느 틱으로 미뤄도 다음 것이 기다립니다.
+        # Six intents that cover the whole sky one after another. Whatever tick a delay picks, the
+        # next one is waiting.
         for index in range(6):
             span = 10 ** 6
             everywhere = Volume4D(1, (LAT0, LON0), (LAT0, LON0), 0.0, 1000.0,
@@ -592,18 +608,20 @@ class ResolutionLadderTest(unittest.TestCase):
         self.assertEqual(decision.policy_hit, "traffic")
         ladders = 1 + len(CANDIDATE_LABELS)
         self.assertLessEqual(filings.count("delay"), ladders * MAX_DELAY_TRIES)
-        # 사다리 하나 = 첫 신청 + 고도 한 번 + 지연 MAX_DELAY_TRIES 번
+        # One ladder = the first filing + one altitude try + MAX_DELAY_TRIES delays
         self.assertLessEqual(len(filings), ladders * (2 + MAX_DELAY_TRIES))
 
 
-# ---------- C4b. 거의 같은 순간에 온 두 신청: 판정에서 의도 등록까지 한 번에 하나 ----------
+# ---------- C4b. Two filings at once: judgement to intent registration, one at a time ----------
 
 
 class ConcurrentFilingTest(unittest.TestCase):
-    """HTTP 처리 스레드마다 file() 이 따로 돕니다. 앞 신청이 조종장치에 명령을 보내는 사이(의도
-    등록 전)에 뒤 신청이 교차 판정을 지나면 둘 다 승인됩니다. 실주행(규칙 모드) 한 판에서 회수된
-    두 기체가 0.2초 간격으로 같은 A* 회랑을 다시 냈고 둘 다 승인되어, 시뮬레이터가 런타임 쪽 분리
-    상실 둘(틱 925, 1338)을 셌습니다. 오프라인 하네스는 한 스레드라 이것을 못 봤습니다."""
+    """file() runs separately on each HTTP handler thread. If a later filing gets through the
+    crossing check while an earlier one is still sending its command to the actuator (before its
+    intent is registered), both are approved. In one live round (rules mode) two recalled
+    aircraft refiled the same A* corridor 0.2 s apart and both were approved, so the simulator
+    counted two losses of separation on the guarded side (ticks 925, 1338). The offline harness
+    is single-threaded and never saw this."""
 
     def test_two_filings_at_once_cannot_both_clear_crossing_corridors(self):
         import threading
@@ -617,7 +635,7 @@ class ConcurrentFilingTest(unittest.TestCase):
         def slow(asset_id, action, params, ledger_id, blast="none", approved_by=None):
             if asset_id == "drone-01":
                 commanding.set()
-                time.sleep(0.4)     # 조종장치가 답하는 동안 — 01 의 의도는 아직 등록 전입니다
+                time.sleep(0.4)     # actuator still answering — 01's intent not yet registered
             return original(asset_id, action, params, ledger_id, blast, approved_by)
 
         adapter.execute = slow
@@ -634,12 +652,12 @@ class ConcurrentFilingTest(unittest.TestCase):
             route("drone-02", [leg(0, 82, 70.0), leg(1500, -1500, 70.0)]))
         first.join(5)
         self.assertTrue(decisions["drone-01"].committed, decisions["drone-01"].reason)
-        self.assertFalse(decisions["drone-02"].committed, "교차하는 두 회랑이 둘 다 승인됐습니다")
+        self.assertFalse(decisions["drone-02"].committed, "both crossing corridors were approved")
         self.assertEqual(decisions["drone-02"].policy_hit, "traffic")
         self.assertEqual([sent[0] for sent in adapter.sent], ["drone-01"])
 
 
-# ---------- C5. 시뮬레이터: 분리 상실과 미룬 출발 ----------
+# ---------- C5. Simulator: loss of separation and delayed departures ----------
 
 
 class SeparationLossTest(unittest.TestCase):
@@ -657,7 +675,8 @@ class SeparationLossTest(unittest.TestCase):
         second.x = first.x
         world._detect_separation_losses(4)
         self.assertEqual(world.score.separation_losses, 2)
-        # 수직으로 25m 이상 떨어지면 분리 상실이 아닙니다. 땅에 있는 기체도 세지 않습니다.
+        # 25 m or more of vertical separation is not a loss of separation. Aircraft on the
+        # ground are not counted either.
         second.alt = 60.0 + 30.0
         world._detect_separation_losses(5)
         second.alt, second.state = 0.0, "ready"
@@ -666,7 +685,7 @@ class SeparationLossTest(unittest.TestCase):
         self.assertIn("separation_losses", world.snapshot(6)["scoreboard"])
 
     def test_the_opening_stops_of_02_and_04_cross_near_the_seats(self):
-        """직결 세계의 분리 상실은 우연이 아니라 배치입니다."""
+        """Loss of separation in the direct wiring comes from the layout, not from chance."""
         areas = {a["name"]: (a["lat"], a["lon"]) for a in sim_world.LANDING_AREAS}
         seat2 = sim_world.to_latlon(*sim_world.seat_of(1))
         seat4 = sim_world.to_latlon(*sim_world.seat_of(3))
@@ -678,7 +697,7 @@ class SeparationLossTest(unittest.TestCase):
 
         crosses = (ccw(seat2, goal4[:2], seat4) != ccw(goal2, goal4, seat4)
                    and ccw(seat2, goal2, seat4) != ccw(seat2, goal2, goal4))
-        self.assertTrue(crosses, "02·04 의 직선이 교차하지 않습니다")
+        self.assertTrue(crosses, "the straight lines of 02 and 04 do not cross")
 
     def test_a_delayed_departure_waits_on_the_ground_and_says_for_whom(self):
         world = sim_world.Simulation().worlds["guarded"]
@@ -699,7 +718,7 @@ class SeparationLossTest(unittest.TestCase):
         world.tick(201)
         self.assertEqual(vehicle.state, "delivering")
         self.assertIsNone(vehicle.public()["holding_for"])
-        # 미루지 않은 승인은 전처럼 바로 뜹니다
+        # An approval without a delay lifts off at once, as before
         other = world.vehicles["drone-02"]
         self.assertIsNone(other.public()["holding_for"])
 
@@ -720,10 +739,10 @@ class SeparationLossTest(unittest.TestCase):
         self.assertEqual(vehicle.waypoints, [])
         self.assertEqual(vehicle.state, "ready")
         self.assertIsNone(vehicle.holding_for)
-        self.assertIsNotNone(vehicle.job_x, "주문은 그대로입니다. 운영사가 다시 냅니다")
+        self.assertIsNotNone(vehicle.job_x, "the order stands; the operator refiles")
 
 
-# ---------- C6. 원장 맥락 ----------
+# ---------- C6. Ledger context ----------
 
 
 class LedgerContextTest(unittest.TestCase):
@@ -758,16 +777,16 @@ class LedgerContextTest(unittest.TestCase):
         self.assertEqual(entry["context"]["checks_run"], ["dedupe"])
 
     def test_policies_in_force_are_named(self):
-        from holdshort.core.config import Policy
+        from shared.config import Policy
 
-        self.runtime.policies.add(Policy("ad-1", "지시", forbid_action="fast_charge"))
-        self.runtime.policies.add(Policy("later", "나중", forbid_action="charge",
+        self.runtime.policies.add(Policy("ad-1", "directive", forbid_action="fast_charge"))
+        self.runtime.policies.add(Policy("later", "later", forbid_action="charge",
                                          active_from_tick=10_000))
         self.runtime.file(route("drone-01", self.legs))
         self.assertEqual(ledger_lines(self.runtime)[-1]["context"]["policies"], ["ad-1"])
 
     def test_replay_still_reads_the_ledger(self):
-        from holdshort.runtime.replay import read_commits
+        from backend.store.replay import read_commits
 
         self.runtime.file(route("drone-01", self.legs))
         commits = read_commits(self.runtime.ledger.path)
@@ -775,11 +794,12 @@ class LedgerContextTest(unittest.TestCase):
         self.assertIn("context", commits[0])
 
 
-# ---------- C7. 검토가 찾은 구멍: 떠 있는 기체, 양 끝, 순응, 착륙장, 회랑 폭, 물림 시점 ----------
+# ---------- C7. Holes the review found ----------
+# Airborne aircraft, endpoints, conformance, landing sites, corridor width, withdrawal timing.
 
 
 class AirbornePresenceTest(unittest.TestCase):
-    """떠 있는 기체는 의도가 없어도 어딘가에 있습니다. 그 자리는 판정이 봐야 합니다."""
+    """An airborne aircraft is somewhere even without an intent. Judgement has to see that spot."""
 
     def setUp(self):
         self.runtime, self.adapter = make_runtime()
@@ -788,11 +808,11 @@ class AirbornePresenceTest(unittest.TestCase):
         self.assertTrue(self.runtime.file(route("drone-01", self.first)).committed)
 
     def _recall_at(self, north_m: float):
-        """01 이 north_m 북쪽에 떠 있는데 앞이 닫힙니다. (회수 결정, 나갈 자리)."""
+        """01 is airborne north_m north when the way ahead closes. (recall decision, exit)."""
         self.runtime.telemetry["drone-01"] = {
             **ground(north_m, 0), "alt_m": 60.0, "state": "delivering",
             "route": [{"lat": self.first[1]["lat"], "lon": self.first[1]["lon"], "alt_m": 60.0}]}
-        closing = Volume("nofly-ahead", "닫힘", box(LAT0 + north(700), LON0 - east(100),
+        closing = Volume("nofly-ahead", "closing", box(LAT0 + north(700), LON0 - east(100),
                                                     LAT0 + north(1100), LON0 + east(100)))
         pulled = self.runtime.recall_flights(closing)
         self.assertEqual(len(pulled), 1)
@@ -801,19 +821,20 @@ class AirbornePresenceTest(unittest.TestCase):
         return pulled[0], door
 
     def test_a_recalled_aircraft_hovering_at_the_exit_blocks_a_filing_through_it(self):
-        # 구역 안(800m)에서 회수 → 가장 가까운 바깥(남쪽 경계 아래)으로 나가 거기 떠 있습니다.
+        # Recalled inside the zone (800 m) → exits to the nearest point outside (below the south
+        # edge) and hovers there.
         _, door = self._recall_at(800)
         self.assertIsNotNone(door)
         standing = self.runtime.intents.get("drone-01")
         self.assertEqual((standing.kind, standing.state), (CONTINGENCY, ACTIVATED))
-        self.assertEqual(len(standing.volumes), 2, "나가는 길 + 끝없는 기둥")
+        self.assertEqual(len(standing.volumes), 2, "way out + open-ended column")
         self.assertEqual(standing.volumes[-1].t_exit, OPEN_ENDED_TICK)
-        # 나갔습니다. 텔레메트리도 그 자리에 떠 있다고 합니다.
+        # It is out. Telemetry also says it is hovering there.
         hover = (door["lat"], door["lon"])
         self.runtime.telemetry["drone-01"] = {"lat": hover[0], "lon": hover[1], "alt_m": 60.0,
                                               "state": "cruising"}
         self.runtime.tick += 60
-        # 02 가 그 자리를 동서로 가로지르는 직선을 냅니다.
+        # 02 files a straight east-west line across that spot.
         hover_n = (hover[0] - LAT0) * METRES_PER_DEG_LAT
         self.runtime.telemetry["drone-02"] = ground(hover_n, -250)
         across = [leg(hover_n, -250, 60.0), leg(hover_n, 250, 60.0)]
@@ -822,7 +843,7 @@ class AirbornePresenceTest(unittest.TestCase):
         self.assertEqual(decision.policy_hit, "traffic")
         self.assertEqual(decision.forbids, "drone-01")
         self.assertEqual(decision.detail["blocked_intent"], standing.id)
-        # 30m 위로는 지나갑니다(기둥은 위아래 ±26.6m).
+        # 30 m higher gets through (the column is ±26.6 m vertically).
         lifted = [{**point, "alt_m": 90.0} for point in across]
         self.assertTrue(self.runtime.file(route("drone-02", lifted)).committed)
 
@@ -834,7 +855,7 @@ class AirbornePresenceTest(unittest.TestCase):
         again = self.runtime.file(route("drone-01", [leg(700, 0, 60.0), leg(700, 600, 60.0)]))
         self.assertTrue(again.committed, again.reason)
         self.assertEqual((standing.state, standing.ended_reason), (ENDED, "replaced"))
-        # 내려앉으면 끝납니다
+        # Landing ends it
         landed = self.runtime.intents.get("drone-01")
         self.runtime.intents.observe(self.runtime.telemetry, self.runtime.tick + 1)
         self.assertEqual(landed.state, ACTIVATED)
@@ -843,7 +864,8 @@ class AirbornePresenceTest(unittest.TestCase):
         self.assertEqual((landed.state, landed.ended_reason), (ENDED, "arrived"))
 
     def test_an_aircraft_that_never_filed_still_occupies_its_place_in_the_air(self):
-        # 등록부에 아무것도 없는 03 이 (800, 300) 60m 에 떠 있습니다(다른 회사, 직결 배선…).
+        # 03, with nothing in the registry, hovers at (800, 300) at 60 m (another company, the
+        # direct wiring…).
         self.runtime.telemetry["drone-03"] = {**ground(800, 300), "alt_m": 60.0,
                                               "state": "cruising"}
         self.runtime.telemetry["drone-02"] = ground(800, 100)
@@ -851,9 +873,9 @@ class AirbornePresenceTest(unittest.TestCase):
         decision = self.runtime.file(route("drone-02", through))
         self.assertIs(decision.verdict, Verdict.DENIED)
         self.assertEqual(decision.forbids, "drone-03")
-        self.assertIsNone(decision.detail["blocked_intent"], "의도가 아니라 자리입니다")
-        self.assertEqual(self.runtime.intents.get("drone-03"), None, "등록부에는 들어가지 않습니다")
-        # 땅에 있으면 자리를 차지하지 않습니다(착륙장 점유는 따로 봅니다)
+        self.assertIsNone(decision.detail["blocked_intent"], "a position, not an intent")
+        self.assertEqual(self.runtime.intents.get("drone-03"), None, "not added to the registry")
+        # On the ground it occupies no place (landing-site occupancy is checked separately)
         self.runtime.telemetry["drone-03"] = ground(800, 300)
         self.assertTrue(self.runtime.file(route("drone-02", through)).committed)
 
@@ -862,7 +884,7 @@ class AirbornePresenceTest(unittest.TestCase):
                                               "state": "delivering"}
         self.runtime.tick += 20
         declined = Proposal(asset_id="drone-01", action="decline_job", cost_usd=0.0,
-                            blast_radius="none", rationale="규정상 경로 없음", params={})
+                            blast_radius="none", rationale="no legal route", params={})
         self.assertTrue(self.runtime.file(declined.to_dict()).committed)
         standing = self.runtime.intents.get("drone-01")
         self.assertEqual((standing.kind, standing.state), (CONTINGENCY, ACTIVATED))
@@ -871,7 +893,8 @@ class AirbornePresenceTest(unittest.TestCase):
 
 
 class EndpointConformanceTest(unittest.TestCase):
-    """경로의 첫 점은 기체가 있는 자리, 끝점은 갈 곳이어야 합니다. 조종장치는 그 사이만 납니다."""
+    """A route's first point must be where the aircraft is and its last point where it is going.
+    The actuator only flies what lies between."""
 
     def setUp(self):
         self.runtime, self.adapter = make_runtime()
@@ -895,10 +918,10 @@ class EndpointConformanceTest(unittest.TestCase):
         params = ledger_lines(self.runtime)[-1]["proposal"]["params"]
         self.assertEqual(params["blocked_kind"], "destination")
         self.assertEqual(params["blocked_leg"], 1)
-        # 이륙장 예약도 같습니다: 끝점은 그 이륙장이어야 합니다
+        # Same for a pad reservation: the last point must be that pad
         self.runtime.pad_coords = {"pad:launch": (LAT0 + north(900), LON0)}
         astray = Proposal(asset_id="drone-01", action="reserve_pad", cost_usd=28.0,
-                          blast_radius="schedule", rationale="충전", resource="pad:launch",
+                          blast_radius="schedule", rationale="charge", resource="pad:launch",
                           params={"pad": "pad:launch",
                                   "legs": [leg(0, 0, 60.0), leg(900, 100, 60.0)]})
         decision = self.runtime.file(astray.to_dict())
@@ -910,13 +933,14 @@ class EndpointConformanceTest(unittest.TestCase):
         self.assertTrue(self.runtime.file(route("drone-01", [leg(0, 0, 60.0),
                                                               leg(1500, 0, 60.0)])).committed)
         self.runtime.tick += 20
-        self.runtime.telemetry["drone-02"] = {"state": "ready"}   # 자리를 모릅니다
+        self.runtime.telemetry["drone-02"] = {"state": "ready"}   # position unknown
         self.assertTrue(self.runtime.file(route("drone-02", [leg(0, 300, 60.0),
                                                               leg(1500, 300, 60.0)])).committed)
 
 
 class DepartureConformanceTest(unittest.TestCase):
-    """미룬 출발을 조종장치가 안 지키면 의도는 실제 출발로 옮겨지고 기록에 남습니다."""
+    """If the actuator does not keep a delayed departure, the intent moves to the actual departure
+    and it goes on the record."""
 
     def test_an_early_departure_reanchors_the_intent_and_is_ledgered(self):
         runtime, _ = make_runtime()
@@ -927,7 +951,7 @@ class DepartureConformanceTest(unittest.TestCase):
         self.assertTrue(decision.committed, decision.reason)
         intent = runtime.intents.get("drone-01")
         self.assertEqual(intent.depart_tick, 600)
-        # 틱 130 에 벌써 떠 있습니다.
+        # Already airborne at tick 130.
         runtime.tick = 130
         runtime.telemetry["drone-01"] = {**ground(0, 0), "alt_m": 12.0, "state": "delivering"}
         runtime.snapshot()
@@ -939,8 +963,8 @@ class DepartureConformanceTest(unittest.TestCase):
         self.assertEqual(noted[0]["proposal"]["params"]["planned_depart_tick"], 600)
         self.assertEqual(noted[0]["context"]["intent_id"], intent.id)
         self.assertEqual(noted[0]["context"]["checks_run"], ["conformance"])
-        # 옮겨진 창으로 판정합니다: 02 의 교차 직선은 이제 겹칩니다(600 근처였다면 비어 있었을
-        # 자리).
+        # Judged against the moved window: 02's crossing line now overlaps (a spot that would
+        # have been clear near 600).
         crossing = [leg(0, 82, 60.0), leg(1500, -1500, 60.0)]
         refused = runtime.file(route("drone-02", crossing))
         self.assertIs(refused.verdict, Verdict.DENIED)
@@ -948,7 +972,7 @@ class DepartureConformanceTest(unittest.TestCase):
 
 
 class LandingSiteOccupancyTest(unittest.TestCase):
-    """착륙장 하나에 두 대는 없습니다 — 의도로도, 서 있는 기체로도."""
+    """Never two aircraft on one landing site — whether by intent or by a parked aircraft."""
 
     SITE = (500, 0)
 
@@ -968,14 +992,15 @@ class LandingSiteOccupancyTest(unittest.TestCase):
         self.assertEqual(decision.detail["blocked_until_tick"], self.runtime.tick + TIME_PAD_TICKS)
 
     def test_landing_after_the_parked_aircraft_has_left_is_approved(self):
-        # 01 은 틱 300 에 그 자리에서 뜹니다. 그 전에 내리면 안 되고, 이륙 기둥이 빈 뒤에는 됩니다.
+        # 01 lifts off from that spot at tick 300. Landing before then is refused; once the
+        # takeoff column is clear, it is allowed.
         away = [leg(*self.SITE, 60.0), leg(500, 1500, 60.0)]
         self.assertTrue(self.runtime.file(route("drone-01", away, depart_after_tick=300,
                                                 resolution="delay", holding_for="x")).committed)
         early = self.runtime.file(route("drone-02", self.onto))
         self.assertIs(early.verdict, Verdict.DENIED)
         self.assertEqual(early.detail["blocked_kind"], "landing")
-        # 01 의 나가는 구간(그 자리에서 시작)이 빈 뒤에 도착하도록 미룹니다.
+        # Delay so it arrives after 01's outbound leg (which starts at that spot) is clear.
         gone = self.runtime.intents.get("drone-01").to_tick
         later = self.runtime.file(route("drone-02", self.onto, depart_after_tick=gone - 60,
                                         resolution="delay", holding_for="drone-01"))
@@ -983,8 +1008,8 @@ class LandingSiteOccupancyTest(unittest.TestCase):
         self.assertGreater(self.runtime.intents.get("drone-02").arrive_tick, gone)
 
     def test_two_live_intents_never_land_on_one_site_whatever_the_gap(self):
-        # 리뷰 S20: 01 이 틱 129 에 내리고 02 가 226 에 내리면 예전 규칙(착륙 기둥 ±30틱)은
-        # 통과였고, 02 는 아직 상자를 내리고 있는 01 위로 내렸습니다.
+        # Review S20: with 01 landing at tick 129 and 02 at 226, the old rule (landing column
+        # ±30 ticks) let it pass, and 02 came down on 01 while 01 was still unloading parcels.
         self.runtime.telemetry["drone-01"] = ground(0, -300)
         first = [leg(0, -300, 60.0), leg(*self.SITE, 60.0)]
         self.assertTrue(self.runtime.file(route("drone-01", first)).committed)
@@ -996,7 +1021,7 @@ class LandingSiteOccupancyTest(unittest.TestCase):
         self.assertEqual(decision.detail["blocked_kind"], "landing")
         self.assertEqual(decision.forbids, "drone-01")
         self.assertGreaterEqual(decision.detail["blocked_until_tick"], other.to_tick)
-        # 다른 자리(60m 옆)에 내리는 것은 됩니다
+        # Landing on another spot (60 m away) is fine
         beside = [leg(0, 300, 60.0), leg(500, 60, 60.0)]
         self.assertTrue(self.runtime.file(route("drone-02", beside)).committed)
 
@@ -1011,12 +1036,13 @@ class LandingSiteOccupancyTest(unittest.TestCase):
         self.assertEqual((world.score.site_conflicts, world.score.separation_losses), (1, 0))
         arriving.alt = 60.0
         world._detect_separation_losses(3)
-        self.assertEqual(world.score.site_conflicts, 1, "25m 위로 지나가는 것은 아닙니다")
+        self.assertEqual(world.score.site_conflicts, 1, "passing above 25 m does not count")
         self.assertIn("site_conflicts", world.snapshot(3)["scoreboard"])
 
 
 class CorridorWidthTest(unittest.TestCase):
-    """회랑 반폭은 분리 최소치 + 항법 오차. 31m 옆의 평행선은 겹치고, 41m 는 비켜 갑니다."""
+    """Corridor half-width is the separation minimum + navigation tolerance. A parallel line
+    31 m to the side overlaps; one 41 m away clears it."""
 
     def setUp(self):
         self.runtime, _ = make_runtime()
@@ -1034,7 +1060,8 @@ class CorridorWidthTest(unittest.TestCase):
 
 
 class DeferredWithdrawalTest(unittest.TestCase):
-    """물림은 검사가 아니라 실행의 일부입니다. 실행되지 않은 재신청은 아무도 물리지 않습니다."""
+    """Withdrawal is part of execution, not a check. A refiling that is never executed withdraws
+    nobody."""
 
     def setUp(self):
         self.runtime, self.adapter = make_runtime()
@@ -1048,7 +1075,7 @@ class DeferredWithdrawalTest(unittest.TestCase):
 
     def _refile(self, **overrides):
         base = Proposal(asset_id="drone-02", action="fly_route", cost_usd=12.0,
-                        blast_radius="schedule", rationale="재신청", params={"legs": self.across})
+                        blast_radius="schedule", rationale="refile", params={"legs": self.across})
         return self.runtime.file({**base.to_dict(), **overrides})
 
     def _diverted(self):
@@ -1059,7 +1086,7 @@ class DeferredWithdrawalTest(unittest.TestCase):
         self.assertIs(decision.verdict, Verdict.HUMAN)
         self.assertEqual(self.first.state, ACCEPTED)
         self.assertEqual(self._diverted(), [])
-        approved = self.runtime.approve(decision.proposal_id, "관제사", allow=True)
+        approved = self.runtime.approve(decision.proposal_id, "controller", allow=True)
         self.assertTrue(approved.committed, approved.reason)
         self.assertEqual((self.first.state, self.first.ended_reason), (ENDED, "withdrawn"))
         self.assertEqual(len(self._diverted()), 1)
@@ -1089,7 +1116,8 @@ class DeferredWithdrawalTest(unittest.TestCase):
 
 
 class GroundDepartureTest(unittest.TestCase):
-    """미룬 출발은 땅의 어느 상태에서 받았든 지켜지고, 땅의 기체는 경로 없이 뜨지 않습니다."""
+    """A delayed departure holds whatever ground state it arrived in, and an aircraft on the
+    ground never lifts off without a route."""
 
     def _world_and_legs(self):
         world = sim_world.Simulation().worlds["guarded"]
@@ -1129,8 +1157,8 @@ class GroundDepartureTest(unittest.TestCase):
         self.assertEqual(vehicle.state, "approaching")
 
     def test_a_withdrawal_from_a_ground_flight_state_never_launches(self):
-        # 리뷰 S5: landed 에서 받은 fly_route 가 delivering 이 됐다가 물리면 cruising 이 되고,
-        # 땅의 cruising 은 스스로 순항 고도까지 올라갔습니다.
+        # Review S5: a fly_route received while landed became delivering, then cruising when
+        # withdrawn, and cruising on the ground climbed to cruise altitude by itself.
         world, vehicle, legs = self._world_and_legs()
         vehicle.state, vehicle.alt, vehicle.waypoints = "delivering", 0.0, [(1, 1, 55.0)]
         world.act("drone-01", "divert_ground", {"withdrawn_for": "drone-03"}, "l_2", "cargo",
@@ -1139,11 +1167,11 @@ class GroundDepartureTest(unittest.TestCase):
         for tick in range(6, 90):
             world.tick(tick)
         self.assertEqual(vehicle.alt, 0.0)
-        # 반려도 같습니다
+        # Same for a declined job
         vehicle.state = "cruising"
         world.act("drone-01", "decline_job", {}, "l_3", "none", None, 90)
         self.assertEqual(vehicle.state, "ready")
-        # 떠 있는 기체가 물리면 제자리 대기(cruising)입니다
+        # An airborne aircraft that is withdrawn holds in place (cruising)
         vehicle.state, vehicle.alt = "delivering", 60.0
         world.act("drone-01", "divert_ground", {}, "l_4", "cargo", None, 91)
         self.assertEqual(vehicle.state, "cruising")

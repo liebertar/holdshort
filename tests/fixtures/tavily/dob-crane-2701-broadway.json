@@ -22,7 +22,7 @@
     "results": [
      {
       "title": "Crane Notice - 2701 Broadway, Manhattan (tower crane)",
-      "url": "https://www.nyc.gov/site/buildings/safety/crane-notices.page#holdshort-fixture-2701-broadway",
+      "url": "https://www.nyc.gov/site/buildings/safety/crane-notices.page#skynet-fixture-2701-broadway",
       "score": 0.87,
       "content": "A tower crane has been approved at 2701 Broadway for the construction of a residential building. See the notice for height and dates."
      }
@@ -34,7 +34,7 @@
    "response": {
     "results": [
      {
-      "url": "https://www.nyc.gov/site/buildings/safety/crane-notices.page#holdshort-fixture-2701-broadway",
+      "url": "https://www.nyc.gov/site/buildings/safety/crane-notices.page#skynet-fixture-2701-broadway",
       "raw_content": "NYC Department of Buildings - Crane Notice CN-26-0914 (fixture). Location: 2701 Broadway, Manhattan. A tower crane has been approved at 2701 Broadway for the construction of a 16-story residential building. The crane will reach a maximum height of 230 feet above grade. The crane will remain erected from September 14, 2026 through November 30, 2026. Crane operations are permitted Monday through Friday, 7:00 AM to 6:00 PM."
      }
     ]

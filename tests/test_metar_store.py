@@ -19,11 +19,11 @@ import threading
 import unittest
 from unittest import mock
 
-from holdshort.core.intake import parse_weather
-from holdshort.core.metar import MetarClient, MetarFailed, MetarPoller, parse_observation
-from holdshort.core.notam import Clock
-from holdshort.runtime.service import Runtime
-from holdshort.runtime.store import IntakeStore
+from backend.runtime.tower import Runtime
+from backend.store.intake_store import IntakeStore
+from shared.intake import parse_weather
+from shared.metar import MetarClient, MetarFailed, MetarPoller, parse_observation
+from shared.notam import Clock
 from sim import world as sim_world
 
 CONFIG = "configs/fleet.yaml"
@@ -78,7 +78,7 @@ def closed_port() -> int:
 
 
 class FakeMetar(http.server.BaseHTTPRequestHandler):
-    """aviationweather.gov 흉내. 클래스 속성으로 답과 상태 코드를 바꿉니다."""
+    """Mimics aviationweather.gov. Class attributes set the answer and the status code."""
 
     body: object = []
     status = 200
@@ -127,8 +127,8 @@ class ParseObservationTest(unittest.TestCase):
         self.assertEqual(half.text(), "KJFK VIS 1/2SM")
         self.assertAlmostEqual(parse_weather(half.text(), CLOCK).visibility_m, 804.7, places=1)
         self.assertIsNone(parse_observation({"icaoId": "KNYC"}),
-                          "바람도 시정도 없으면 읽을 것이 없음")
-        self.assertIsNone(parse_observation({"wspd": 10}), "관측소가 없으면 관측이 아님")
+                          "no wind and no visibility, nothing to read")
+        self.assertIsNone(parse_observation({"wspd": 10}), "no station, no observation")
         self.assertIsNone(parse_observation("KNYC 24018KT"))
 
 
@@ -158,7 +158,7 @@ class MetarClientTest(FakeServerCase):
         with mock.patch.dict(os.environ, {"METAR": "off"}):
             self.assertIsNone(MetarClient.from_env(["KNYC"]))
         with mock.patch.dict(os.environ, {"METAR": "on", "METAR_URL": self.url}):
-            self.assertIsNone(MetarClient.from_env([]), "관측소가 없으면 꺼짐")
+            self.assertIsNone(MetarClient.from_env([]), "no stations means off")
             self.assertEqual(MetarClient.from_env(["KNYC"]).base_url, self.url)
 
 
@@ -175,20 +175,21 @@ class MetarRuntimeTest(FakeServerCase):
         runtime.absorb([])
         snap = runtime.snapshot()
         hold = snap["weather"]["hold"]
-        self.assertIsNotNone(hold, "공식 관측은 관제탑 공지처럼 그 틱에 걸립니다")
+        self.assertIsNotNone(hold, "an official observation applies the tick it lands, "
+                                   "like the runtime's own bulletin")
         self.assertEqual((hold["id"], hold["source"]), ("metar-KNYC-1757500000", "grammar"))
         self.assertEqual([p["action"] for p in snap["awaiting_human"]], ["lift_weather_hold"],
-                         "사람 확인 카드(publish_weather)는 없고 '일찍 풀까요' 카드만")
+                         "no human-check card (publish_weather), only the 'lift early?' card")
         self.assertEqual(snap["intake"]["sources"]["metar"], "on")
         self.assertEqual(snap["intake"]["metar"]["last_fetch_tick"], 2200)
         metar_items = [i for i in snap["intake"]["items"] if i["source"] == "metar"]
         self.assertEqual(len(metar_items), 2)
         self.assertTrue(all(i["trusted"] for i in metar_items))
-        self.assertEqual(codes(runtime), [], "켜진 채 시작한 것은 적을 일이 아닙니다")
+        self.assertEqual(codes(runtime), [], "starting up already on is nothing to log")
         poller.fetch_once()
         runtime.absorb([])
         self.assertEqual(len([i for i in runtime.snapshot()["intake"]["items"]
-                              if i["source"] == "metar"]), 2, "같은 관측은 한 번만")
+                              if i["source"] == "metar"]), 2, "the same observation only once")
 
     def test_an_unreachable_network_is_off_with_one_line_and_recovery_is_one_line(self):
         runtime, poller = self._runtime_with(f"http://127.0.0.1:{closed_port()}/x")
@@ -221,10 +222,10 @@ class MetarRuntimeTest(FakeServerCase):
         runtime._follow_round(1)
         runtime.absorb([])
         hold = runtime.snapshot()["weather"]["hold"]
-        self.assertIsNotNone(hold, "판이 바뀌었다고 돌풍이 멎지 않습니다")
+        self.assertIsNotNone(hold, "a new round does not stop the gusts")
         self.assertEqual(hold["id"], first)
-        self.assertEqual(len(FakeMetar.paths), 1, "다음 주기(최대 1분)를 기다리지 않습니다")
-        # 망이 끊겨도 지난 관측은 그대로 — 대기를 푸는 것은 창이나 사람입니다.
+        self.assertEqual(len(FakeMetar.paths), 1, "no wait for the next cycle (up to 1 min)")
+        # Network down, the last observation stays — the window or a person lifts the hold.
         runtime.metar.base_url = f"http://127.0.0.1:{closed_port()}/x"
         poller.fetch_once()
         runtime.tick = 5
@@ -269,12 +270,12 @@ class IntakeStoreTest(unittest.TestCase):
         for source in sources:
             store.put_item(f"{source}-1", source, "text", 1)
         self.assertFalse(any(store.seen(f"{source}-1", source) for source in sources),
-                         "받기만 하고 끝을 못 본 것은 본 것이 아닙니다 — 다시 읽습니다")
+                         "received but never settled is not seen — it gets read again")
         for source in sources:
             store.settle_item(f"{source}-1", "weather", "grammar", "read")
         self.assertTrue(store.seen("tavily-1", "tavily") and store.seen("manual-1", "manual"))
         self.assertFalse(store.seen("sim-1", "sim") or store.seen("metar-1", "metar"),
-                         "판마다 다시 오는 공지와 지금 유효한 관측은 다시 읽어야 합니다")
+                         "per-round notices and still-valid observations must be read again")
         store.put_item("sim-1", "sim", "text", 99)
         again = next(i for i in store.items() if i["id"] == "sim-1")
         self.assertEqual((again["fetched_tick"], again["read_by"], again["outcome"]),
@@ -302,12 +303,12 @@ class IntakeStoreTest(unittest.TestCase):
                 "text": "FIRE AT 4705 CENTER BOULEVARD", "address": "4705 Center Boulevard",
                 "radius_m": 150.0, "reopened": True}])
             self.assertFalse(again.seen("manual-fire", "manual"),
-                             "다시 읽어 카드를 다시 올립니다")
+                             "read again so the card goes back up")
             answered = next(i for i in again.items() if i["id"] == "manual-gust")
-            self.assertEqual(answered["outcome"], "refused", "한 번 답한 것은 그 답 그대로")
+            self.assertEqual(answered["outcome"], "refused", "once answered, the answer stands")
             self.assertTrue(again.seen("manual-gust", "manual"))
             self.assertEqual(again.rules()[0]["lifted_by"], "restart")
-            self.assertEqual(again.reopen_waiting(), [], "한 번만 되돌립니다")
+            self.assertEqual(again.reopen_waiting(), [], "reopens only once")
 
     def test_a_file_from_before_the_hints_column_opens_and_keeps_working(self):
         with tempfile.TemporaryDirectory() as folder:
@@ -336,27 +337,27 @@ class StoreRuntimeTest(unittest.TestCase):
             first.submit_intake(line)
             first.absorb([])
             self.assertEqual(waiting(first), ["publish_weather"])
-            # 재시작. 카드는 프로세스와 함께 사라졌고 아무도 답하지 않았습니다 — 다시
-            # 올립니다, 한 번.
+            # Restart. The card died with the process and nobody answered it — so it goes back
+            # up, once.
             second = make_runtime(path)
             second.absorb([])
             self.assertEqual(waiting(second), ["publish_weather"])
             second.submit_intake(line)
             second.absorb([])
             self.assertEqual(waiting(second), ["publish_weather"],
-                             "같은 문장을 또 넣어도 카드는 하나")
+                             "the same line submitted again still makes one card")
             received = [e for e in second.ledger.read_all() if e["outcome"] != "pending"
                         and e["decision"]["code"] == "intake_received"]
             self.assertEqual([e["decision"]["detail"].get("reopened") for e in received], [True])
-            # 사람이 답했습니다. 그다음 재시작에는 다시 오르지 않고, 같은 문장도 다시 안 읽습니다.
-            second.approve(second.snapshot()["awaiting_human"][0]["id"], "관제사", allow=False)
+            # A person answered. The next restart does not raise it again or reread the same line.
+            second.approve(second.snapshot()["awaiting_human"][0]["id"], "controller", allow=False)
             third = make_runtime(path)
             third.submit_intake(line)
             third.absorb([])
             self.assertEqual(waiting(third), [])
             self.assertEqual([e for e in third.ledger.read_all()
                               if e["proposal"]["action"] == "intake"], [])
-            # 시뮬레이터 공지는 판마다 다시 읽힙니다 — 재시작도 마찬가지.
+            # Simulator notices are read again every round — after a restart too.
             third.absorb([{**sim_world.WEATHER, "published_tick": 2175, "until_tick": 2700}])
             self.assertIsNotNone(third.snapshot()["weather"]["hold"])
 
@@ -384,8 +385,8 @@ class StoreRuntimeTest(unittest.TestCase):
         self.assertEqual({k: r["applied"] for k, r in rules.items()},
                          {"manual-a": False, "manual-b": False})
         held = {p["params"]["item"]: p["id"] for p in runtime.snapshot()["awaiting_human"]}
-        runtime.approve(held["manual-a"], "관제사", allow=True)
-        runtime.approve(held["manual-b"], "관제사", allow=False)
+        runtime.approve(held["manual-a"], "controller", allow=True)
+        runtime.approve(held["manual-b"], "controller", allow=False)
         rules = {r["item_id"]: r for r in runtime.store.rules()}
         self.assertEqual((rules["manual-a"]["applied"], rules["manual-a"]["lifted_by"]),
                          (True, None))

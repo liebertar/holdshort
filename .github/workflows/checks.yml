@@ -1,0 +1,53 @@
+name: checks
+
+on:
+  pull_request:
+    branches: [dev, main]
+  push:
+    branches: [dev, main]
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install ruff==0.13.3
+      - run: ruff check backend drone shared sim tests scripts
+
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - run: pip install pyyaml==6.0.2 pymavlink==2.4.49
+      - run: PYTHONPATH=. python -m unittest discover -s tests
+      - run: node --test tests/test_map.mjs
+
+  compose:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker compose -f docker-compose.local.yml --env-file .env.local.example config -q
+      - run: docker compose -f docker-compose.dev.yml --env-file .env.dev.example config -q
+
+  # main takes pull requests from dev only.
+  from-dev:
+    if: github.event_name == 'pull_request' && github.base_ref == 'main'
+    runs-on: ubuntu-latest
+    steps:
+      - run: |
+          if [ "$HEAD_REF" != "dev" ]; then
+            echo "main only accepts pull requests from dev, not from $HEAD_REF"
+            exit 1
+          fi
+        env:
+          HEAD_REF: ${{ github.head_ref }}

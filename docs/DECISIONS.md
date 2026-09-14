@@ -24,15 +24,16 @@ Cleared routes become temporary reserved volumes instead.
 **Tighten now, loosen with a person.** A rule that closes airspace applies the tick it arrives; a rule that
 opens it waits for a human or an expiry. Model-read prose is always held for a person before it applies.
 
-**Lost link: continue and land, never return.** A return path is an uncleared path, and if the tower itself
+**Lost link: continue and land, never return.** A return path is an uncleared path, and if the runtime itself
 fails every aircraft would turn at once into each other. Finishing the cleared route keeps the deconfliction
 that already exists. The runtime's job is to keep the dark aircraft's space reserved.
 
 **Nemotron for forms, prose and summaries; A\* for geometry.** Measured, not assumed: local drafts clear the
 judge only on short routes. The map says who drew each corridor so this is visible, not hidden.
 
-**Budgets removed from the runtime.** Money caps put a healthy aircraft into a human queue mid-round. That
-is the operator's concern; the runtime's authority is physical.
+**Budgets are off by default.** Money caps put a healthy aircraft into a human queue mid-round. Spending is
+the operator's concern; the runtime's authority is physical. The authority check still enforces a cap if
+`configs/fleet.yaml` sets one.
 
 **Roof bays 31 m apart.** Designated, visible, one per aircraft. 22 m tripped the 30 m parked-aircraft rule;
 31 m clears it while takeoff columns still overlap, so simultaneous departures serialise — the right picture.
@@ -45,8 +46,8 @@ once; a search snippet or a manual post waits for a person even when the grammar
 **SQLite for the intake store, on the same volume as the ledger.** Same availability needs, no new service,
 swappable behind a thin interface if a deployment wants Postgres.
 
-**Name.** Attaché described a helper that attaches to something. The system is a clearance authority: agents
-hold short until the tower clears. Hence Holdshort.
+**Name.** sky-net is the net over a shared sky that every operator's drones fly inside. Spelled apart from
+the film's Skynet on purpose: this one cannot move anything on its own. Agents propose; code clears.
 
 **The model chooses among the planner's routes; it does not draw them.** A 4B model writing waypoints rarely
 cleared the judge on long crossings. Finding a path between buildings is a search, and A* does it. Choosing
@@ -70,6 +71,17 @@ aircraft inside at closure is allowed the time to the nearest exit at cruise fro
 (22 ticks); every tick after that counts, and so does every tick of an aircraft that entered after closure.
 Both wirings are scored the same way. The difference is that one of them can be told to leave.
 
-**The tower gets its own model server.** The Ollama app loads a 262,144-token context, which puts over 5 GB
+**The runtime gets its own model server.** The Ollama app loads a 262,144-token context, which puts over 5 GB
 more KV cache on the same 4B model, while a notice is about 2,000 characters. `scripts/ollama_fleet.sh` starts
-a tower server on 11439 with an 8k context, and the resolver prefers it to 11434.
+a runtime server on 11439 with an 8k context, and the resolver prefers it to 11434.
+
+**One folder per stack.** `frontend`, `backend`, `drone`, `shared` and `sim`, each with its own Dockerfile.
+What would ship to an aircraft and what runs at the authority are separate images, and the guarded drone
+image is built without the runtime, the adapters or the direct wiring, so nothing in it can reach a motor.
+
+**The map shows the runtime's world only.** The direct wiring is the comparison, not the product. It runs as an
+optional overlay and in the seeded harness for the scoreboard; the map draws only what the runtime clears.
+
+**The runtime is drawn at 26 Federal Plaza.** A clearance service shared by every operator belongs to no
+operator's depot. The map places it on a federal building in Lower Manhattan, with its links at 600 m so
+they clear the skyline.

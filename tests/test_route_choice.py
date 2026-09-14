@@ -21,8 +21,8 @@ import time
 import unittest
 from unittest import mock
 
-from holdshort.agent import loop as loop_module
-from holdshort.agent.chooser import (
+from drone.agent import loop as loop_module
+from drone.agent.chooser import (
     CHOICE_TOOL,
     REASON_CHARS,
     RouteChooser,
@@ -31,22 +31,23 @@ from holdshort.agent.chooser import (
     rule_choice,
     situation_from_state,
 )
-from holdshort.agent.detect import Concern
-from holdshort.agent.loop import GuardedAgent
-from holdshort.agent.planner import OperatorPlanner
-from holdshort.agent.propose import Proposer
-from holdshort.agent.trace import TRACE_BYTES, choice_part, form_part, model_trace, route_part
-from holdshort.core.geo import first_breach
-from holdshort.core.models import Proposal
-from holdshort.core.route import keep_clear_shapes, route_samples, same_route
-from holdshort.llm import client as client_module
-from holdshort.llm.client import LlmReply, LlmTier, TieredLlm
+from drone.agent.detect import Concern
+from drone.agent.loop import GuardedAgent
+from drone.agent.planner import OperatorPlanner
+from drone.agent.propose import Proposer
+from drone.agent.trace import TRACE_BYTES, choice_part, form_part, model_trace, route_part
+from shared.geo import first_breach
+from shared.llm import client as client_module
+from shared.llm.client import LlmReply, LlmTier, TieredLlm
+from shared.models import Proposal
+from shared.route import keep_clear_shapes, route_samples, same_route
 from tests.fixture_llm import FIXTURE_DIR, FixtureLlm, load_fixtures
 
-RUNTIME_DIR = pathlib.Path(__file__).resolve().parent.parent / "holdshort" / "runtime"
+RUNTIME_DIR = pathlib.Path(__file__).resolve().parent.parent / "backend"
 CHOICE_FIXTURES = FIXTURE_DIR / "choices_nano.json"
 
-# 빈 공역에서 북쪽으로 2.2 km. 다른 기체의 승인 회랑이 한가운데를 동서로 가로지릅니다.
+# 2.2 km north through empty airspace. Another aircraft's cleared corridor crosses the middle
+# east to west.
 HERE = (40.70000, -73.98000)
 GOAL = (40.72000, -73.98000)
 CROSSING = [{"lat": 40.71000, "lon": -73.98300, "alt_m": 90.0},
@@ -69,7 +70,7 @@ TELEMETRY = {"id": "drone-t", "model": "dv-x500", "lat": HERE[0], "lon": HERE[1]
              "job": "Morningside Park", "job_lat": GOAL[0], "job_lon": GOAL[1], "battery": 66.0,
              "stops_left": 2, "state": "loading"}
 REFUSAL = {"verdict": "denied", "policy_hit": "airspace", "code": "airspace",
-           "reason": "1번 구간이 규정을 어깁니다", "forbids": "bldg-x", "detail": {}}
+           "reason": "leg 1 breaks the rules", "forbids": "bldg-x", "detail": {}}
 APPROVAL = {"verdict": "auto", "policy_hit": None, "reason": "", "detail": {}}
 CANDIDATE_KEYS = ["id", "label", "legs", "length_m", "max_alt_m", "min_alt_m", "reason_tags"]
 
@@ -79,11 +80,11 @@ def _call(arguments: dict, name: str = CHOICE_TOOL) -> dict:
 
 
 class ScriptedToolLlm(TieredLlm):
-    """도구 답과 JSON 답을 차례로 냅니다. 무엇을 물었는지 적습니다.
+    """Hands out tool replies and JSON replies in order, and records what was asked.
 
-    도구 답 하나: {"name", "arguments"} 사전(도구 호출), 문자열(글로만 답함),
-    None(서버가 답을 못 함),
-    "unsupported"(서버가 도구를 모름 — 400).
+    One tool reply is a {"name", "arguments"} dict (a tool call), a string (a prose-only
+    answer), None (the server could not answer), or "unsupported" (the server knows no
+    tools — 400).
     """
 
     def __init__(self, tool_replies=(), json_replies=(), model: str = "scripted-nano"):
@@ -127,7 +128,7 @@ class ScriptedToolLlm(TieredLlm):
 
 
 class FakeRuntime:
-    """post_json 대역. 답을 차례로 내고 신청을 적습니다."""
+    """Stand-in for post_json. Hands out answers in order and records the filings."""
 
     def __init__(self, *answers):
         self.answers = list(answers)
@@ -139,7 +140,7 @@ class FakeRuntime:
 
 
 class StubDrafter:
-    """모델 초안 대역. 정해진 legs(또는 None)와 기록을 돌려줍니다."""
+    """Stand-in for the model drafter. Returns fixed legs (or None) and its record."""
 
     name = "nano:stub"
 
@@ -159,7 +160,7 @@ class StubDrafter:
 
 
 class NoRoutePlanner(OperatorPlanner):
-    """규정 안의 길이 하나도 없는 사본."""
+    """A copy with no legal route at all."""
 
     def candidates(self, start, goal, context=None, budget_s=None):
         return []
@@ -170,7 +171,7 @@ class NoRoutePlanner(OperatorPlanner):
 
 def _agent(llm: TieredLlm, planner: OperatorPlanner | None = None, drafter=None) -> GuardedAgent:
     agent = GuardedAgent("drone-t", "http://runtime.test", Proposer(llm), llm)
-    agent.planner = planner or OperatorPlanner()        # 빈 공역: 계획기가 밀리초에 답합니다
+    agent.planner = planner or OperatorPlanner()        # empty airspace: answers in milliseconds
     agent.drafter = drafter
     agent.redraw_s = 0.01
     return agent
@@ -178,12 +179,12 @@ def _agent(llm: TieredLlm, planner: OperatorPlanner | None = None, drafter=None)
 
 def _proposal() -> Proposal:
     return Proposal(asset_id="drone-t", action="fly_route", cost_usd=12.0,
-                    blast_radius="schedule", rationale="시험", params={})
+                    blast_radius="schedule", rationale="test", params={})
 
 
 def _file(agent: GuardedAgent, runtime: FakeRuntime, state: dict | None = None,
           form: dict | None = None):
-    """post_json 은 대역 런타임으로, /state 는 주어진 상태로, 텔레메트리는 그대로."""
+    """post_json goes to the stand-in runtime, /state to the given state, telemetry as is."""
     def get(url, timeout=5.0):
         return (state or {}) if url.endswith("/state") else dict(TELEMETRY)
 
@@ -200,11 +201,11 @@ def _candidates(ids=("a", "b", "c"), a_tags=("detour",)) -> list[dict]:
              "reason_tags": list(a_tags) if i == "a" else [i]} for i in ids]
 
 
-# ---------- 후보 ----------
+# ---------- Candidates ----------
 
 
 class CandidatesInOpenAirTest(unittest.TestCase):
-    """빈 공역: 무엇이 후보를 가르는지만 봅니다(건물 없이)."""
+    """Empty airspace: only what sets the candidates apart (no buildings)."""
 
     def setUp(self):
         self.planner = OperatorPlanner()
@@ -224,13 +225,14 @@ class CandidatesInOpenAirTest(unittest.TestCase):
         def closest(candidate):
             return min(corridor.distance_m(*p) for p in route_samples(candidate["legs"]))
 
-        self.assertLess(closest(found["a"]), 30.0, "최단은 회랑을 가로지릅니다")
-        self.assertGreater(closest(found["c"]), 200.0, "(c) 는 회랑에서 떨어져 돕니다")
+        self.assertLess(closest(found["a"]), 30.0, "the shortest cuts across the corridor")
+        self.assertGreater(closest(found["c"]), 200.0, "(c) swings wide of the corridor")
         self.assertIn("near-traffic:drone-02", found["a"]["reason_tags"])
         self.assertIn("clear-of-traffic", found["c"]["reason_tags"])
 
     def test_nothing_to_avoid_and_nothing_lower_means_one_candidate(self):
-        """빈 공역에서는 (b) 가 (a) 와 같은 길이라 빠지고, 비킬 것이 없으면 (c) 도 없습니다."""
+        """In empty airspace (b) is the same route as (a) and drops out; with nothing to
+        avoid there is no (c) either."""
         self.assertEqual([c["id"] for c in self.planner.candidates(HERE, GOAL, None)], ["a"])
 
     def test_a_zero_budget_leaves_only_the_shortest(self):
@@ -251,7 +253,8 @@ class CandidatesInOpenAirTest(unittest.TestCase):
 
 
 class CandidatesOverManhattanTest(unittest.TestCase):
-    """실제 공역(건물 3만 4천 동, FAA 격자): 후보는 전부 판정을 통과하고 서로 다릅니다."""
+    """Real airspace (34,000 buildings, the FAA grid): every candidate passes judgement and
+    no two are alike."""
 
     @classmethod
     def setUpClass(cls):
@@ -283,15 +286,15 @@ class CandidatesOverManhattanTest(unittest.TestCase):
         for index, first in enumerate(self.found):
             for second in self.found[index + 1:]:
                 self.assertFalse(same_route(first["legs"], second["legs"]),
-                                 f"{first['id']} 와 {second['id']} 가 같은 길입니다")
+                                 f"{first['id']} and {second['id']} are the same route")
 
     def test_there_is_more_than_one_route_to_choose_from(self):
-        """이 여정은 실측에서 셋 다 나왔습니다(4.2/4.3/4.5 km). 선택지가 없으면
-        고를 것도 없습니다."""
+        """On a real run this trip produced all three (4.2/4.3/4.5 km). With no options
+        there is nothing to choose."""
         self.assertGreaterEqual(len(self.found), 2, self.planner.router.last_timings)
 
 
-# ---------- 클라이언트: 도구 호출 ----------
+# ---------- Client: tool calling ----------
 
 
 def completion(content=None, **message):
@@ -373,7 +376,7 @@ class ToolCallingClientTest(unittest.TestCase):
             self.assertIsNone(llm.ask_tools(LlmTier.NANO, "s", "u", self.TOOLS))
             self.assertIsNone(llm.ask_tools(LlmTier.NANO, "s", "u", self.TOOLS))
         self.assertFalse(llm.tools_ok)
-        self.assertEqual(len(calls), 2, "두 번째는 묻지도 않습니다")
+        self.assertEqual(len(calls), 2, "the second one is not even asked")
         self.assertEqual((llm.stats["nano"].ok, llm.stats["nano"].fallback), (0, 0))
 
     def test_a_timeout_is_counted_and_not_retried(self):
@@ -397,7 +400,7 @@ class ToolCallingClientTest(unittest.TestCase):
         self.assertEqual(saved["tools"], [CHOICE_TOOL])
 
 
-# ---------- 고르기 ----------
+# ---------- Choosing ----------
 
 
 class ChooserTest(unittest.TestCase):
@@ -432,7 +435,7 @@ class ChooserTest(unittest.TestCase):
         self.assertEqual(choice.fallback_reason, "invalid id")
         self.assertEqual(chooser.counts["invalid"], 1)
         self.assertEqual((llm.stats["nano"].ok, llm.stats["nano"].fallback), (0, 1))
-        self.assertEqual(llm.json_asks, [], "틀린 id 는 다시 묻지 않고 규칙이 고릅니다")
+        self.assertEqual(llm.json_asks, [], "a wrong id is not asked again; the rules pick")
 
     def test_a_call_to_some_other_tool_is_not_a_choice(self):
         llm = ScriptedToolLlm([_call({"id": "b"}, name="fly_there")])
@@ -490,7 +493,7 @@ class ChooserTest(unittest.TestCase):
         crowded = _candidates(a_tags=("detour", "near-traffic:drone-02"))
         self.assertEqual(chooser.choose(crowded, {}).chosen, "c")
         self.assertEqual(chooser.choose(_candidates(("a", "b")), {"traffic_refusal": True})
-                         .chosen, "a", "(c) 가 없으면 (a)")
+                         .chosen, "a", "(a) when there is no (c)")
 
     def test_one_candidate_is_not_worth_a_question(self):
         llm = ScriptedToolLlm([_call({"id": "a", "reason": "x"})])
@@ -513,8 +516,8 @@ class SituationTest(unittest.TestCase):
                       "drone-02 ticks 800-1200 (flying)", "a) shortest", "b) lowest altitude",
                       "c) clear of traffic", "9.8 km", CHOICE_TOOL):
             self.assertIn(words, brief)
-        self.assertNotIn("HELD", brief, "사람이 확인하기 전 공지는 아무것도 막지 않습니다")
-        self.assertNotIn("drone-t ticks", brief, "자기 의도는 남의 창이 아닙니다")
+        self.assertNotIn("HELD", brief, "a notice blocks nothing until a person confirms it")
+        self.assertNotIn("drone-t ticks", brief, "its own intent is not someone else's window")
 
     def test_a_weather_hold_and_a_traffic_refusal_read_as_words(self):
         state = {**STATE, "weather": {"hold": {"until_tick": 2700, "reason": "gusts 14 m/s > 12"}}}
@@ -534,7 +537,7 @@ class SituationTest(unittest.TestCase):
         self.assertEqual(keep_clear_from_state({}, "drone-t"), {"traffic": [], "keepouts": []})
 
 
-# ---------- 신청서에 실리는 것 ----------
+# ---------- What goes on the filing ----------
 
 
 class FiledChoiceTest(unittest.TestCase):
@@ -633,7 +636,7 @@ class FiledChoiceTest(unittest.TestCase):
 
 
 class FormTraceTest(unittest.TestCase):
-    CONCERN = Concern("needs_route", "normal", "배달지 Morningside Park, 배터리 66%")
+    CONCERN = Concern("needs_route", "normal", "delivering to Morningside Park, battery 66%")
 
     def _write(self, llm) -> dict:
         proposer = Proposer(llm)
@@ -678,7 +681,7 @@ class FormTraceTest(unittest.TestCase):
         self.assertEqual((trace["model"], trace["fallback_reason"]), ("", "timeout"))
 
     def test_the_trace_stays_under_one_kilobyte_and_keeps_its_keys(self):
-        form = form_part("m", "concern " * 200, "fly_route", "여기서 " * 400, 1, True, None)
+        form = form_part("m", "concern " * 200, "fly_route", "from here " * 400, 1, True, None)
         route = route_part("choice", choice_part(_candidates(), "c", "because " * 100),
                            {"asked": True, "latency_ms": 1, "breach": "x" * 900, "used": False})
         trace = model_trace(form, route)
@@ -693,15 +696,15 @@ class FormTraceTest(unittest.TestCase):
 
 
 class AirspaceRefreshTest(unittest.TestCase):
-    """공역 사본을 못 받으면 지난 사본을 둡니다. 빈 사본으로 바꿔 끼우면 건물 없는
-    도시를 그립니다."""
+    """If the airspace copy cannot be fetched, the last copy stays. Swapping in an empty one
+    would draw a city with no buildings."""
 
     VOLUME = {"id": "bldg-z", "name": "Z", "polygon": [[40.71, -73.981], [40.71, -73.979],
                                                        [40.711, -73.979], [40.711, -73.981]],
               "ceiling_m": 60.0, "clearance_m": 50.0, "rule": "forbidden"}
 
     def _step(self, agent, answer):
-        telemetry = {"airspace_revision": 7, "state": "grounded"}   # 걱정거리 없음: 새로 받기만
+        telemetry = {"airspace_revision": 7, "state": "grounded"}   # no concerns: just a refetch
 
         def get(url, timeout=5.0):
             return answer if url.endswith("/airspace") else telemetry
@@ -715,7 +718,7 @@ class AirspaceRefreshTest(unittest.TestCase):
         before.load([self.VOLUME])
         self._step(agent, None)
         self.assertIs(agent.planner, before)
-        self.assertIsNone(agent.airspace_revision, "판본을 적지 않아 다음 차례에 다시 받습니다")
+        self.assertIsNone(agent.airspace_revision, "no revision kept, so it refetches next turn")
         self._step(agent, {"volumes": []})
         self.assertIs(agent.planner, before)
 
@@ -726,11 +729,11 @@ class AirspaceRefreshTest(unittest.TestCase):
         self.assertIsNotNone(agent.planner.airspace.get("bldg-z"))
 
 
-# ---------- 녹음된 답 ----------
+# ---------- Recorded replies ----------
 
 
 class FixtureToolLlm(FixtureLlm):
-    """녹음된 도구 답(kind=choice)을 바늘로 돌려줍니다. 맞는 것이 없으면 None."""
+    """Serves recorded tool replies (kind=choice) by needle. None when nothing matches."""
 
     def ask_tools(self, tier, system, user, tools, tool_choice="required", max_tokens=200,
                   timeout_s=None):
@@ -749,7 +752,8 @@ class FixtureToolLlm(FixtureLlm):
 
 
 class RecordedChoicesTest(unittest.TestCase):
-    """로컬 Nemotron(nemotron-3-nano:4b)이 실주행에서 실제로 한 고르기. 오프라인으로 다시 봅니다."""
+    """Choices the local Nemotron (nemotron-3-nano:4b) really made on a live run, replayed
+    offline."""
 
     @classmethod
     def setUpClass(cls):
@@ -773,12 +777,12 @@ class RecordedChoicesTest(unittest.TestCase):
 
 class RuntimeNeverReadsTheChoiceTest(unittest.TestCase):
     def test_no_runtime_file_mentions_the_choice_or_the_trace(self):
-        """고르기와 흔적은 운영사 쪽 라벨입니다. 판정이 그것을 읽기 시작하면
-        모델이 판정에 섞입니다."""
+        """The choice and the trace are operator-side labels. Once judgement starts reading
+        them, the model has leaked into the judgement."""
         for path in RUNTIME_DIR.rglob("*.py"):
             text = path.read_text(encoding="utf-8")
             for word in ("route_choice", "model_trace", CHOICE_TOOL):
-                self.assertNotIn(word, text, f"{path.name} 이 {word} 를 읽습니다")
+                self.assertNotIn(word, text, f"{path.name} reads {word}")
 
 
 if __name__ == "__main__":

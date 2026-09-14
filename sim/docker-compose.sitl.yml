@@ -1,0 +1,65 @@
+# One real PX4 autopilot behind the runtime; everything else stays simulated.
+#
+#   docker compose -f docker-compose.local.yml -f sim/docker-compose.sitl.yml --env-file .env.local up --build
+#
+# What is the record and what is the mirror:
+#   The simulator is the world of record for all four aircraft: loading, the scoreboard and the
+#   telemetry used for judging. One of them, drone-01 (MAVLINK_MIRROR), is also flown by PX4.
+#   Every command the runtime executes for it goes to the simulator first, then to PX4. A cleared
+#   route becomes a PX4 mission (MISSION_ITEM_INT), recalls and weather holds reach a real
+#   autopilot, and a refused filing never even arms it.
+#   The simulator's answer decides success; PX4's answer is only written alongside
+#   (/state.autopilots, and autopilot.jsonl next to the ledger). The direct wiring (direct-*) is
+#   untouched and stays simulated.
+#
+# PX4 runs SIH (the autopilot simulates the airframe itself), so there is no Gazebo: half a CPU
+# core and 10 MiB of memory. The official image px4io/px4-sitl-gazebo ships amd64 and arm64, so
+# the same file runs on a Mac and on an NVIDIA machine.
+#
+# To watch:
+#   curl -s localhost:8000/state | python3 -c 'import json,sys; print(json.load(sys.stdin)["autopilots"])'
+#   QGroundControl shows this aircraft on UDP 14550.
+#
+# To run the stack on the host with only PX4 in a container, use scripts/sitl.sh (for demos).
+
+services:
+  px4:
+    image: px4io/px4-sitl-gazebo:v1.18.0-beta2
+    environment:
+      PX4_SIM_MODEL: sihsim_quadx
+      # The mirrored aircraft's seat on the depot roof (sim/world.py SEATS[0], SEAT_ROOF_M=9).
+      # Starting here makes PX4's track overlay that aircraft on the map.
+      PX4_HOME_LAT: "40.701803"
+      PX4_HOME_LON: "-73.970437"
+      PX4_HOME_ALT: "9"
+      # Speed factor 1: SIH lockstep holds only 1x in Docker on this Mac (measured: 1x → 0.94x,
+      # 2x → an erratic 0.96–1.74x, 4x → 0.26x: slower, and CPU-bound). At the default 0.2 s tick
+      # the sim runs at 4x, so PX4 lags its aircraft on the map; TICK_SECONDS=0.8 keeps them level.
+      PX4_SIM_SPEED_FACTOR: ${PX4_SIM_SPEED_FACTOR:-1}
+      # Match the simulated aircraft: cruise 22 m/s, climb 2 m/s, descent 1.75 m/s.
+      PX4_PARAM_MPC_XY_CRUISE: "20"
+      PX4_PARAM_MPC_XY_VEL_MAX: "20"
+      PX4_PARAM_MPC_TKO_SPEED: "2"
+      PX4_PARAM_MPC_Z_V_AUTO_UP: "2"
+      PX4_PARAM_MPC_Z_V_AUTO_DN: "1.75"
+      # This wiring has no RC transmitter, so losing RC during a mission is not a failure.
+      PX4_PARAM_COM_RCL_EXCEPT: "1"
+      # Container that receives offboard MAVLink; the entrypoint resolves the name to an address.
+      MAVLINK_PARTNER: runtime
+    volumes:
+      - ./sim/fleet-entrypoint.sh:/fleet-entrypoint.sh:ro
+    entrypoint: ["/bin/sh", "/fleet-entrypoint.sh"]
+    # So the ground-station link reaches the host on Linux too (Docker Desktop has it built in).
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    networks: [world]
+    restart: unless-stopped
+
+  runtime:
+    environment:
+      ADAPTER: composite
+      MAVLINK_MIRROR: ${MAVLINK_MIRROR:-drone-01}
+      MAVLINK_ENDPOINT: udpin:0.0.0.0:14540
+      # PX4's answers go to a line file next to the ledger; a ledger row closes before PX4 answers.
+      AUTOPILOT_LOG: /data/autopilot.jsonl
+    depends_on: [sim, px4]

@@ -13,10 +13,7 @@ import json
 import tempfile
 import unittest
 
-from holdshort.core import config as config_module
-from holdshort.core.geo import METRES_PER_DEG_LAT, METRES_PER_DEG_LON, Volume, box
-from holdshort.core.models import Proposal, Verdict
-from holdshort.runtime.intents import (
+from backend.runtime.intents import (
     ACTIVATED,
     ENDED,
     LOST_LINK_MARGIN_TICKS,
@@ -26,7 +23,10 @@ from holdshort.runtime.intents import (
     first_conflict,
     schedule,
 )
-from holdshort.runtime.service import Runtime
+from backend.runtime.tower import Runtime
+from shared import config as config_module
+from shared.geo import METRES_PER_DEG_LAT, METRES_PER_DEG_LON, Volume, box
+from shared.models import Proposal, Verdict
 from sim import world as sim_world
 
 CONFIG = "configs/fleet.yaml"
@@ -48,7 +48,7 @@ def leg(north_m: float, east_m: float, alt_m: float) -> dict:
 
 def route(asset: str, legs: list[dict], **params) -> dict:
     return Proposal(asset_id=asset, action="fly_route", cost_usd=12.0, blast_radius="schedule",
-                    rationale="시험", params={"legs": legs, **params}).to_dict()
+                    rationale="test", params={"legs": legs, **params}).to_dict()
 
 
 def ground(north_m: float, east_m: float, tick: int | None = None) -> dict:
@@ -126,11 +126,11 @@ class LinkWatchTest(unittest.TestCase):
     def test_a_stamp_that_stops_for_the_timeout_is_lost_once_and_moving_again_restores_it(self):
         watch = LinkWatch(15)
         self.assertEqual(watch.observe({"d": aloft(0, 0, 100)}, 100), [])
-        self.assertEqual(watch.observe({"d": aloft(0, 0, 100)}, 114), [], "14틱은 아직입니다")
+        self.assertEqual(watch.observe({"d": aloft(0, 0, 100)}, 114), [], "not yet at 14 ticks")
         events = watch.observe({"d": aloft(0, 0, 100)}, 115)
         self.assertEqual([(e.kind, e.since_tick, e.last_seen_tick, e.tick) for e in events],
                          [("lost", 101, 100, 115)])
-        self.assertEqual(watch.observe({"d": aloft(0, 0, 100)}, 140), [], "두절은 한 번")
+        self.assertEqual(watch.observe({"d": aloft(0, 0, 100)}, 140), [], "declared lost once")
         self.assertEqual(watch.snapshot()["d"], {"status": "lost", "since_tick": 101,
                                                  "last_seen_tick": 100, "declared_tick": 115})
         events = watch.observe({"d": aloft(0, 0, 150)}, 150)
@@ -148,7 +148,8 @@ class LinkWatchTest(unittest.TestCase):
 
 
 class IntentReserveTest(unittest.TestCase):
-    """두절 예약은 남은 경로만 늘립니다. 지나온 부피를 다시 막으면 이륙 기둥이 막힙니다."""
+    """The lost-link reserve stretches only the remaining route. Re-blocking volumes already
+    flown would block the takeoff column."""
 
     def setUp(self):
         performance = config_module.load(CONFIG).performance
@@ -165,7 +166,7 @@ class IntentReserveTest(unittest.TestCase):
         at = (LAT0 + north(2000), LON0 + east(1000), 60.0)
         until = self.intent.reserve_dark(seen, at)
         self.assertEqual([(v.t_enter, v.t_exit) for v in self.intent.volumes[:2]],
-                         self.before[:2], "이륙 기둥과 지나온 첫 구간은 그대로")
+                         self.before[:2], "takeoff column and first leg flown are unchanged")
         arrive = self.intent.arrive_tick
         for volume in self.intent.volumes[2:]:
             self.assertLessEqual(volume.t_enter, seen)
@@ -177,8 +178,8 @@ class IntentReserveTest(unittest.TestCase):
         self.assertIsNone(self.intent.dark_since)
 
     def test_an_aircraft_behind_its_schedule_keeps_the_leg_it_is_actually_on(self):
-        seen = self.intent.volumes[2].t_enter + 60        # 일정상으로는 둘째 구간
-        at = (LAT0 + north(1500), LON0, 60.0)             # 실제로는 첫 구간 위
+        seen = self.intent.volumes[2].t_enter + 60        # on schedule, the second leg
+        at = (LAT0 + north(1500), LON0, 60.0)             # actually over the first leg
         self.intent.reserve_dark(seen, at)
         self.assertEqual((self.intent.volumes[0].t_enter, self.intent.volumes[0].t_exit),
                          self.before[0])
@@ -189,12 +190,12 @@ class IntentReserveTest(unittest.TestCase):
         self.assertTrue(self.intent.covers(LAT0 + north(1000), LON0 + east(20), 70.0))
         self.assertFalse(self.intent.covers(LAT0 + north(1000), LON0 + east(200), 60.0))
         self.assertTrue(self.intent.covers(LAT0 + north(2000), LON0 + east(2000), 0.0),
-                        "목적지에 내려앉은 것은 착륙 기둥 안입니다")
+                        "touched down at the destination is inside the landing column")
 
 
 class LostLinkRuntimeTest(unittest.TestCase):
-    """drone-01 이 북쪽 3000m 를 60m 로 납니다. drone-02 는 동쪽에 서서 그 길을 가로지르려
-    합니다."""
+    """drone-01 flies 3000m north at 60m. drone-02 stands to the east and tries to cross its
+    path."""
 
     def setUp(self):
         self.runtime, self.adapter = make_runtime()
@@ -206,16 +207,18 @@ class LostLinkRuntimeTest(unittest.TestCase):
         self.windows = [(v.t_enter, v.t_exit) for v in self.intent.volumes]
         self.cruise = self.intent.volumes[1]
         self.assertFalse(self.cruise.is_column)
-        # 명목 창(여유 포함)이 닫히는 틱. 두절 뒤에는 cruise.to_tick 이 늘어나므로 미리 적어 둡니다.
+        # Tick the nominal window (margin included) closes. cruise.to_tick grows once the link is
+        # lost, so note it up front.
         self.nominal_to = self.cruise.to_tick
-        # 떴습니다. 순항 구간 1000m 지점에서 마지막으로 보입니다.
+        # Airborne. Last seen 1000m into the cruise leg.
         self.seen = self.cruise.t_enter + 57
         self._at(self.seen, drone_01=aloft(1000, 0, self.seen))
         self.assertEqual(self.intent.state, ACTIVATED)
         self.sent = len(self.adapter.sent)
 
     def _at(self, tick: int, drone_01: dict | None = None) -> list:
-        """틱을 옮기고 텔레메트리를 받습니다. drone-02 의 도장은 늘 새것, drone-01 은 준 것만."""
+        """Moves the tick and takes telemetry. drone-02's stamp is always fresh; drone-01 gets
+        only what is passed in."""
         self.runtime.tick = tick
         if drone_01 is not None:
             self.runtime.telemetry["drone-01"] = drone_01
@@ -229,9 +232,10 @@ class LostLinkRuntimeTest(unittest.TestCase):
         self.assertEqual([e.kind for e in events], ["lost"])
 
     def _crossing(self, cross_tick: int) -> dict:
-        """drone-02 가 2000m 북쪽에서 동 → 서로 drone-01 의 길을 cross_tick 무렵에 건너는 신청.
+        """A filing: drone-02 crosses drone-01's path east → west, 2000m north, around cross_tick.
 
-        오르는 데 38틱(60m / 1.6m), 400m 를 가는 데 23틱 — 출발을 그만큼 앞에 둡니다."""
+        Climbing takes 38 ticks (60m / 1.6m) and 400m takes 23 ticks — so departure is moved that
+        much earlier."""
         return route("drone-02", [leg(2000, 400, 60), leg(2000, -400, 60)],
                      depart_after_tick=cross_tick - 61)
 
@@ -254,7 +258,7 @@ class LostLinkRuntimeTest(unittest.TestCase):
         self.assertEqual((card[0]["asset_id"], card[0]["blast_radius"]), ("drone-01", "schedule"))
         self.assertTrue(card[0]["rationale"].startswith(f"no telemetry since tick {self.seen + 1}"))
         self.assertEqual(self.runtime._decisions[card[0]["id"]].code, "human_lost_link")
-        self.assertEqual(len(self.adapter.sent), self.sent, "끊긴 기체는 들을 수 없습니다")
+        self.assertEqual(len(self.adapter.sent), self.sent, "a dark aircraft cannot hear")
 
     def _crossing_volumes(self, cross_tick: int):
         crossing = self._crossing(cross_tick)
@@ -263,9 +267,9 @@ class LostLinkRuntimeTest(unittest.TestCase):
         return volumes
 
     def test_a_crossing_the_nominal_window_allowed_is_refused_while_the_aircraft_is_dark(self):
-        cross = self.nominal_to + 10              # 명목 창(여유 포함)이 닫힌 뒤
+        cross = self.nominal_to + 10              # past the nominal window (margin included)
         self.assertIsNone(first_conflict(self._crossing_volumes(cross), [self.intent]),
-                          "링크가 살아 있으면 명목 창 밖의 교차는 겹치지 않습니다")
+                          "with the link up, a crossing outside the nominal window is clear")
         self._go_dark()
         self.assertIsNotNone(first_conflict(self._crossing_volumes(cross), [self.intent]))
         decision = self.runtime.file(self._crossing(cross))
@@ -281,12 +285,12 @@ class LostLinkRuntimeTest(unittest.TestCase):
         later = reserved_until + 30
         self._at(later)
         self.assertTrue(self.runtime.file(self._crossing(later + 90)).committed,
-                        "신고한 대로 내렸을 시각이 지나면 길은 풀립니다")
+                        "once it would have landed as declared, the route frees up")
         self.runtime.telemetry["drone-03"] = ground(2600, 300, later)
         onto = self.runtime.file(route("drone-03", [leg(2600, 300, 60), leg(3000, 20, 60)]))
         self.assertIs(onto.verdict, Verdict.DENIED)
         self.assertEqual((onto.detail["blocked_kind"], onto.forbids), ("landing", "drone-01"),
-                         "착륙장은 링크가 돌아올 때까지 그 기체의 것입니다")
+                         "the landing site stays that aircraft's until the link returns")
 
     def test_the_dark_aircraft_cannot_be_given_a_route_and_nothing_is_banned(self):
         self._go_dark()
@@ -301,7 +305,7 @@ class LostLinkRuntimeTest(unittest.TestCase):
         self._go_dark()
         self.runtime.telemetry["drone-01"] = {**self.runtime.telemetry["drone-01"],
                                               "route": [leg(3000, 0, 60)]}
-        closing = Volume("nofly-t", "닫힘", box(LAT0 + north(1800), LON0 - east(100),
+        closing = Volume("nofly-t", "closing", box(LAT0 + north(1800), LON0 - east(100),
                                                 LAT0 + north(2200), LON0 + east(100)))
         self.assertEqual(self.runtime.recall_flights(closing), [])
         self.assertEqual(len(self.adapter.sent), self.sent)
@@ -325,7 +329,7 @@ class LostLinkRuntimeTest(unittest.TestCase):
                          ("lapsed", "link_restored"))
         self.assertEqual(self.runtime.snapshot()["links"]["drone-01"]["status"], "ok")
         self.assertEqual([(v.t_enter, v.t_exit) for v in self.intent.volumes], self.windows,
-                         "다시 보이니 승인 때의 창으로")
+                         "visible again, so back to the windows it was cleared with")
 
     def test_telemetry_back_outside_what_was_cleared_is_nonconforming(self):
         self._go_dark()
@@ -350,19 +354,20 @@ class LostLinkRuntimeTest(unittest.TestCase):
     def test_a_person_can_release_the_space_early(self):
         self._go_dark()
         card = cards(self.runtime, "lost_link_notice")[0]
-        decision = self.runtime.approve(card["id"], "관제사", allow=True)
-        self.assertEqual((decision.code, decision.approved_by), ("lost_link_released", "관제사"))
+        decision = self.runtime.approve(card["id"], "controller", allow=True)
+        self.assertEqual((decision.code, decision.approved_by),
+                         ("lost_link_released", "controller"))
         self.assertEqual((self.intent.state, self.intent.ended_reason), (ENDED, "released"))
         self.assertTrue(self.runtime.file(self._crossing(self.nominal_to + 10)).committed)
         self.assertEqual(self.runtime.snapshot()["links"]["drone-01"]["status"], "lost",
-                         "사람이 풀어도 링크는 끊긴 채입니다")
+                         "a person releasing the space does not restore the link")
         self.assertEqual([s for s in self.adapter.sent[self.sent:] if s[0] == "drone-01"], [],
-                         "푸는 것도 기체에 보내는 명령이 아닙니다")
+                         "releasing is not a command to the aircraft either")
 
     def test_or_keep_it_until_telemetry_returns(self):
         self._go_dark()
         card = cards(self.runtime, "lost_link_notice")[0]
-        self.assertEqual(self.runtime.approve(card["id"], "관제사", allow=False).code,
+        self.assertEqual(self.runtime.approve(card["id"], "controller", allow=False).code,
                          "lost_link_kept")
         self.assertIs(self.runtime.file(self._crossing(self.nominal_to + 10)).verdict,
                       Verdict.DENIED)
@@ -379,8 +384,8 @@ class LostLinkRuntimeTest(unittest.TestCase):
 
 
 class SimSceneTest(unittest.TestCase):
-    """시뮬레이터: 창이 열리면 떠서 경로를 날던 첫 기체가 끊기고, 그대로 날며, 명령을
-    못 듣습니다."""
+    """Simulator: when the window opens, the first aircraft airborne on a route goes dark,
+    keeps flying, and cannot hear commands."""
 
     def setUp(self):
         self.world = sim_world.World("guarded", 7, None)
@@ -398,13 +403,13 @@ class SimSceneTest(unittest.TestCase):
         frozen = self.world.snapshot(start)["assets"]["drone-02"]
         self.assertEqual(frozen["telemetry_tick"], start - 1)
         self.assertFalse(frozen["link_lost"],
-                         "텔레메트리는 두절을 말하지 않습니다 — 도장이 멈출 뿐")
+                         "telemetry does not announce a lost link — the stamp just stops")
         for tick in range(start + 1, start + 20):
             self.world.tick(tick)
         later = self.world.snapshot(start + 19, truth=True)
         self.assertEqual((later["assets"]["drone-02"]["lat"], later["assets"]["drone-02"]["lon"]),
                          (frozen["lat"], frozen["lon"]))
-        self.assertNotEqual(later["dark"]["drone-02"]["lat"], frozen["lat"], "기체는 계속 납니다")
+        self.assertNotEqual(later["dark"]["drone-02"]["lat"], frozen["lat"], "it keeps flying")
         self.assertEqual(later["assets"]["drone-01"]["telemetry_tick"], start + 19)
         actions = self.world.score.actions
         refused = self.world.act("drone-02", "divert_ground", {}, "l_x", "cargo", None, start + 19)
@@ -422,18 +427,18 @@ class SimSceneTest(unittest.TestCase):
         other = self.world.vehicles["drone-03"]
         ahead = sim_world.to_grid(40.7300, -73.9700)
         path = self.dark.waypoints[0]
-        # drone-02 의 남은 길 위, 같은 고도. 그 길 위의 한 점을 고릅니다.
+        # On drone-02's remaining path, at the same altitude: pick a point on that path.
         other.x = self.dark.x + (path[0] - self.dark.x) * 0.5
         other.y = self.dark.y + (path[1] - self.dark.y) * 0.5
         other.alt = 90.0
         other.route_tick = start + sim_world.LINK_TIMEOUT_TICKS - 1
         self.world._detect_link_lost_incursions(start + 30)
         self.assertEqual(self.world.score.link_lost_incursions, 0,
-                         "두절을 알 수 없던 때 받은 경로는 세지 않습니다")
+                         "a route cleared before the loss was knowable does not count")
         other.route_tick = start + sim_world.LINK_TIMEOUT_TICKS
         self.world._detect_link_lost_incursions(start + 31)
         self.world._detect_link_lost_incursions(start + 32)
-        self.assertEqual(self.world.score.link_lost_incursions, 1, "쌍마다 들어갈 때 한 번")
+        self.assertEqual(self.world.score.link_lost_incursions, 1, "once per pair, on entry")
         other.x, other.y = ahead[0] + 20, ahead[1]
         self.world._detect_link_lost_incursions(start + 33)
         other.x = self.dark.x + (path[0] - self.dark.x) * 0.5

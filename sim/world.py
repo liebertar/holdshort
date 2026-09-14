@@ -15,7 +15,8 @@ import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
-from holdshort.core.geo import (
+from shared.config import plural
+from shared.geo import (
     DEFAULT_CEILING_M,
     METRES_PER_DEG_LAT,
     METRES_PER_DEG_LON,
@@ -27,27 +28,29 @@ from holdshort.core.geo import (
     building_clearance_m,
     nearest_exit,
 )
-from holdshort.core.notam import Clock, parse_notice
+from shared.notam import Clock, parse_notice
 
-# 물류 기지는 브루클린 네이비야드. 배달지는 이스트강 건너 맨해튼입니다.
-# 실제 배송 기업이 도심 배달 거점을 두는 자리이고, 강을 건너야 해서 헬리포트 주변
-# 0ft 구역을 지나게 됩니다. 그게 이 데모의 전부입니다.
-DEPOT = (47.8, 54.9)                       # 브루클린 네이비야드 40.702,-73.970
-# 이륙장 하나. 창고 바로 옆입니다. 두 자리를 350m 떨어뜨려 놨더니 한 거점으로
-# 안 읽혔고, 자리가 남으면 두 기체가 다툴 일도 없어 잠금표와 중재가 놀았습니다.
-# 비상 착륙대(모터 고장 때만). 창고 옥상 자리와 떨어진 마당 동쪽에 둡니다 — 옥상 자리와 겹치면
-# 고장 기체가 옆 자리 기체 위로 내리려다 거절만 받습니다.
+# The depot is the Brooklyn Navy Yard; the deliveries are across the East River in Manhattan.
+# It is where real delivery companies put their urban hubs, and crossing the river means
+# passing the 0 ft zones around the heliport. That is the whole demo.
+DEPOT = (47.8, 54.9)                       # Brooklyn Navy Yard 40.702,-73.970
+# One pad, right next to the depot. With two pads 350 m apart it did not read as one hub, and
+# with a spare pad no two aircraft ever contended, so the lock table and arbitration sat idle.
+# Emergency landing pad (motor failure only). It sits on the east side of the yard, away from
+# the roof seats — overlapping a seat, a failing aircraft would try to land on the aircraft in
+# the next seat and only get refused.
 PADS = {"pad:launch": (48.55, 54.95)}
-# 창고 마당의 자리. 기체마다 제 자리가 있고, 한 줄로 24m 씩 떨어져 있습니다.
-# 여기서 하루를 시작하고(싣는 중), 배달을 마치면 여기로 돌아와 땅에서 다음 차례를 기다립니다.
-# 이륙장(충전대)은 하나뿐이라 자원이고, 마당 자리는 자원이 아니라 잠금이 없습니다.
-# 이륙장을 돌아오는 비행 내내 잡고 있으면 나머지 기체가 배달지에서 몇 분씩 서 있었고,
-# 한 점에 겹쳐 내리면 네 대가 한 대로 보였습니다.
-# 자리는 창고 옥상 위 한 줄입니다(긴 축 97 m 를 따라 31 m 간격, 바깥 둘은 옥상 가장자리에 걸침).
-# 마당에 두었더니 창고 옆 아무 데나 앉는 것처럼 보였습니다. 31 m 는 서 있는 기체와의 이격(30 m)
-# 바로 밖이라 옆 자리에 내릴 수 있고, 이륙 기둥(회랑 폭 40 m)은 겹쳐서 동시에 뜨면 런타임이 한 대를
-# 기다리게 합니다 — 그게 맞는 그림입니다. 옥상 높이는 화면이 올려 그리는 데만 씁니다(시뮬 고도는
-# 지면 기준).
+# Seats at the depot. Each aircraft has its own, in a row 24 m apart. The day starts here
+# (loading), and after its deliveries an aircraft comes back and waits for its next turn on the
+# ground. The pad (charger) is the one resource; seats are not resources, so they have no locks.
+# Holding the pad for the whole return flight left the other aircraft standing for minutes at
+# their drops, and landing all on one point made four aircraft look like one.
+# The seats are a row on the depot roof (31 m apart along its 97 m long axis; the outer two
+# overhang the roof edge). In the yard they looked like parking anywhere next to the depot.
+# 31 m is just outside the clearance from a parked aircraft (30 m), so a neighbouring seat can
+# be landed on, while the takeoff columns (corridor width 40 m) overlap, so when two lift off at
+# once the runtime makes one wait — which is the right picture. The roof height is only used to
+# raise the drawing on screen (sim altitudes are above ground).
 SEATS = [
     (47.4462, 54.9415),   # 40.701803, -73.970437,
     (47.6652, 55.0284),   # 40.7016, -73.970185,
@@ -60,63 +63,69 @@ SEAT_ROOF_M = 9.0
 def seat_of(index: int) -> tuple[float, float]:
     return SEATS[index % len(SEATS)]
 
-# 맨해튼. 배터리파크에서 센트럴파크 북단까지, 이스트강 건너 롱아일랜드시티까지.
-# 여기를 고른 이유는 FAA 가 격자마다 허용 고도를 공개하기 때문입니다.
-# 맨해튼은 전부 금지가 아닙니다. 격자의 40% 가 400ft(122m)까지 허용되고,
-# 24% 는 허가 없이 못 납니다. 한 블록 건너 천장이 바뀝니다.
-# configs/airspace/nyc.json 이 그 실제 데이터이고, scripts/fetch_airspace.py 가 받아옵니다.
+# Manhattan: from Battery Park to the north end of Central Park, and across the East River to
+# Long Island City. Chosen because the FAA publishes the allowed altitude for every grid cell.
+# Manhattan is not all forbidden: 40% of the cells allow up to 400 ft (122 m), and in 24% there
+# is no flight without authorisation. The ceiling changes from one block to the next.
+# configs/airspace/nyc.json is that real data; scripts/fetch_airspace.py fetches it.
 ORIGIN_LAT, ORIGIN_LON = 40.6900, -74.0250
 SPAN_LAT, SPAN_LON = 0.1400, 0.1150
 CRUISE_ALT_M = 90.0
-LOITER_ALT_M = 45.0  # 승인 전 대기 고도
+LOITER_ALT_M = 45.0  # holding altitude before clearance
 
-# 격자 한 칸은 정사각형이 아닙니다. 위도 40.7도에서 동서로 약 97 m, 남북으로 약 258 m.
-# 격자 단위로 등속 이동하면 남북이 2.7배 빨라집니다 — 브루클린에서 맨해튼으로 가는
-# 배달은 대부분 남북이라, 그게 화면에서 보이던 속도의 정체였습니다. 그래서 미터로 움직입니다.
+# A grid cell is not square: at latitude 40.7 it is about 97 m east-west and 258 m
+# north-south. Constant speed in grid units makes north-south 2.7 times faster — and deliveries
+# from Brooklyn to Manhattan run mostly north-south, which was the speed seen on screen. So
+# movement is in metres.
 METRES_PER_CELL_X = 97.0
 METRES_PER_CELL_Y = 258.0
 
-# 1틱이 나타내는 시간. 화면 재생 속도(TICK_SECONDS)와는 별개입니다.
-# 재생이 0.2초면 시뮬레이션 시간이 실제보다 4배 빠르게 흐릅니다.
+# Simulated time per tick, separate from the playback rate (TICK_SECONDS).
+# At 0.2 s playback, simulated time runs 4 times faster than real time.
 SIM_SECONDS_PER_TICK = 0.8
-CRUISE_MPS = 22.0             # 배달용 멀티로터 순항 속도
-# 항속. 배터리 관리는 런타임이 아니라 운영사의 몫이라, 여기서는 '충전을 신청할 이유'만
-# 있으면 됩니다 — 충전대 경쟁과 리콜 공지가 물 자리가 그것뿐입니다. 기체가 떨어지는 건
-# 보여줄 것이 아니라 잡음이라, 한 판 안에 소진되지 않을 만큼 넉넉하게 둡니다.
-# 11km 반경에서 한 바퀴(배달 두 곳 + 창고)가 2천 틱 = 시뮬레이션 27분입니다. 한 바퀴에
-# 절반 안쪽만 쓰고 마당에서 채우도록 넉넉히 둡니다. 배터리 때문에 배달을 중단하고
-# 돌아오는 장면은 이 데모가 보여줄 것이 아닙니다.
+CRUISE_MPS = 22.0             # cruise speed of a delivery multirotor
+# Endurance. Battery management is the operator's job, not the runtime's, so all that is
+# needed here is a reason to file for charging — the only hook for charger contention and the
+# recall notice. An aircraft running flat is noise, not something to show, so endurance is
+# generous enough never to run out within a round.
+# At an 11 km radius one trip (two drops + the depot) is 2,000 ticks = 27 simulated minutes.
+# Generous enough that a trip uses under half and the yard tops it up. Aborting a delivery to
+# come back for the battery is not what this demo is about.
 ENDURANCE_MIN = 60.0
 CLIMB_MPS = 2.0
-# 짐. 창고에서 여섯 상자를 싣고 나가 착륙장 두 곳에서 세 상자씩 내리고, 그 자리에서 돌아갈
-# 상자를 두 개씩 받아 창고로 가져옵니다. 창고에서 그것을 내리고 다시 여섯 개를 싣습니다.
-# 상자는 그렇게 계속 쌓이고 내려집니다 — 기체가 앉아만 있는 순간은 없습니다.
+# Cargo. An aircraft loads six boxes at the depot, drops three at each of two landing sites,
+# picks up two return boxes at each and brings them back, unloads them at the depot and loads
+# six again. Boxes keep going on and off — there is never a moment an aircraft just sits.
 PARCELS_PER_TRIP = 6
 PARCELS_PER_STOP = 3
 PICKUP_PER_STOP = 2
 STOPS_PER_TRIP = 2
-# 상자 하나를 싣거나 내리는 시간. 화면(틱 0.2초)에서 1.2초 — 상자가 하나씩 늘고 줄어드는 게
-# 보여야 멈춰서 싣고 내리는 중이라는 것이 읽힙니다. 1초보다 짧으면 한꺼번에 사라져 보입니다.
+# Time to load or unload one box: 1.2 s on screen (0.2 s ticks). Boxes have to visibly come
+# and go one at a time for a stop to read as loading or unloading; under 1 s they seem to
+# vanish all at once.
 BOX_TICKS = 5
-LOAD_TICKS = PARCELS_PER_TRIP * BOX_TICKS   # 창고에서 싣는 시간(36틱, 7.2초)
-DROP_TICKS = PARCELS_PER_STOP * BOX_TICKS   # 배달지에서 내리는 시간(18틱, 3.6초)
-# 승인을 확인하고 출발하기까지. 화면의 승인 표시(노란 선 2.4초 + 판정 0.6초 + 초록 깜빡임
-# 1.4초 = 4.4초, 22틱)가 끝난 다음 떠야 '승인 전에 날아간다'로 보이지 않습니다.
-# 폴링 0.5초 여유를 더합니다. ui/map-route.mjs 의 GROW/CHECK/APPROVED_HOLD 와 같이 바꿀 것.
-# 거절은 여기서 세지 않습니다 — 운영사가 화면의 거절 표시가 끝난 뒤에 다시 그리므로
-# (holdshort/agent/loop.py REDRAW_DELAY_S) 거절과 승인은 실제 시간에서 이미 떨어져 있습니다.
+LOAD_TICKS = PARCELS_PER_TRIP * BOX_TICKS   # loading time at the depot (36 ticks, 7.2 s)
+DROP_TICKS = PARCELS_PER_STOP * BOX_TICKS   # unloading time at a drop (18 ticks, 3.6 s)
+# From confirming a clearance to departure. Taking off only after the screen's clearance
+# animation (yellow line 2.4 s + judgement 0.6 s + green blink 1.4 s = 4.4 s, 22 ticks) keeps
+# it from looking like 'flying before clearance'. Plus 0.5 s of polling margin. Change together
+# with GROW/CHECK/APPROVED_HOLD in frontend/map-route.mjs.
+# Refusals are not counted here — the operator redraws only after the screen's refusal display
+# ends (drone/agent/loop.py REDRAW_DELAY_S), so refusal and clearance are already apart in real
+# time.
 CLEARANCE_TICKS = 25
 DESCENT_MPS = 1.75
-# 지상에서 일하는 상태. 이 동안 들어온 승인은 상태를 바꾸지 않고 기다렸다가 ready 에서 띄웁니다.
+# Ground-work states. A clearance that arrives meanwhile leaves the state alone and waits to
+# take off from ready.
 GROUND_WORK = ("loading", "dropping", "picking", "ready")
 
-STEP_METRES = CRUISE_MPS * SIM_SECONDS_PER_TICK      # 틱당 17.6 m
+STEP_METRES = CRUISE_MPS * SIM_SECONDS_PER_TICK      # 17.6 m per tick
 BATTERY_PER_TICK = 100.0 / (ENDURANCE_MIN * 60.0) * SIM_SECONDS_PER_TICK
-CLIMB_RATE_M = CLIMB_MPS * SIM_SECONDS_PER_TICK      # 틱당 상승
-DESCENT_RATE_M = DESCENT_MPS * SIM_SECONDS_PER_TICK  # 틱당 하강
-# 경유점에 이만큼 붙으면 다음 구간으로. 한 틱 이동(17.6m)보다 작게 잡아야
-# 기체가 경유점에 정확히 내려앉습니다. 넉넉하게 잡으면 그만큼 모서리를 자르고,
-# 50m 격자로 건물 사이를 지나는 경로에서는 그 몇 미터가 건물입니다.
+CLIMB_RATE_M = CLIMB_MPS * SIM_SECONDS_PER_TICK      # climb per tick
+DESCENT_RATE_M = DESCENT_MPS * SIM_SECONDS_PER_TICK  # descent per tick
+# This close to a waypoint, move on to the next leg. It must be smaller than one tick's travel
+# (17.6 m) for the aircraft to settle exactly on the waypoint. A generous radius cuts corners
+# by as much, and on a 50 m grid route between buildings those few metres are building.
 ARRIVAL_RADIUS_M = 6.0
 
 
@@ -126,7 +135,7 @@ def to_latlon(x: float, y: float) -> tuple[float, float]:
 
 def _segment_distance_m(point: tuple[float, float], a: tuple[float, float],
                         b: tuple[float, float]) -> float:
-    """미터 평면에서 점과 선분 사이의 거리."""
+    """Distance between a point and a segment on the metre plane."""
     dx, dy = b[0] - a[0], b[1] - a[1]
     length2 = dx * dx + dy * dy
     if length2 < 1e-9:
@@ -145,19 +154,20 @@ COSTS = {
     "depart": 0.0,
 }
 
-# 기체가 기지에 닿는 데 468~605틱 걸립니다(22 m/s). 공지와 구역 폐쇄는
-# 그들이 실제로 충전대에 있을 때 도착해야 의미가 있습니다.
+# Aircraft take 468-605 ticks to reach the depot (22 m/s). The notice and the zone closure only
+# mean something if they arrive while the aircraft are actually at the charger.
 RECALL_TICK = 1050
 
-# 상시 공역. 한 동네 안에서도 허용 고도가 갈립니다 — 실제 데이터가 그렇게 생겼습니다.
-# FAA UAS Facility Map 은 격자마다 천장이 다르고, ED-269 구역은 하한·상한을 갖습니다.
+# Standing airspace. The allowed altitude varies even within one neighbourhood — that is what
+# the real data looks like. The FAA UAS Facility Map has a ceiling per grid cell, and ED-269
+# zones have a floor and a ceiling.
 AIRSPACE_FILE = os.getenv(
     "AIRSPACE_FILE", str(Path(__file__).resolve().parent.parent / "configs/airspace/nyc.json")
 )
 
 
 def load_bands() -> list[dict]:
-    """같은 등급끼리 합쳐진 덩어리. 화면 바닥에 칠할 때 씁니다. 격자 없는 칸도 채웁니다."""
+    """Cells merged by class, for painting the screen's ground. Also fills cells off the grid."""
     try:
         raw = json.loads(Path(AIRSPACE_FILE).read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
@@ -169,12 +179,12 @@ def load_bands() -> list[dict]:
     return bands
 
 
-# FAA UAS 시설 지도 격자는 30초각(0.008333도) 정사각형이고 통제 공역에만 칸이 있습니다.
-# 칸이 없는 곳(허드슨 강 한가운데 같은)은 비어 있는 게 아니라 14 CFR 107.51 의 기본 상한
-# 400ft 가 적용되는 곳입니다. 판정(geo.DEFAULT_CEILING_M)이 이미 그렇게 보고 있으니 화면도 같은
-# 색으로 칠합니다 — 비어 보이면 "여긴 뭐지"가 됩니다.
+# FAA UAS Facility Map cells are 30-arc-second (0.008333 deg) squares, only in controlled
+# airspace. A place with no cell (the middle of the Hudson, say) is not empty: the 14 CFR 107.51
+# default ceiling of 400 ft applies there. The judgement (geo.DEFAULT_CEILING_M) already treats
+# it so, and the screen paints it the same colour — left blank, it only prompts "what is this?".
 GRID_CELL_DEG = 0.008333
-GRID_ORIGIN = (40.68334, -74.02501)      # nyc.json 격자의 남서쪽 모서리
+GRID_ORIGIN = (40.68334, -74.02501)      # south-west corner of the nyc.json grid
 
 
 def default_band(volumes: list[dict]) -> dict | None:
@@ -187,8 +197,8 @@ def default_band(volumes: list[dict]) -> dict | None:
         have.add((round((lat0 - GRID_ORIGIN[0]) / GRID_CELL_DEG),
                   round((lon0 - GRID_ORIGIN[1]) / GRID_CELL_DEG)))
     rings = []
-    for row in range(-12, 19):          # 위도 40.58 ~ 40.84
-        for col in range(-10, 22):      # 경도 -74.11 ~ -73.84
+    for row in range(-12, 19):          # latitude 40.58 to 40.84
+        for col in range(-10, 22):      # longitude -74.11 to -73.84
             if (row, col) in have:
                 continue
             lat0 = GRID_ORIGIN[0] + row * GRID_CELL_DEG
@@ -198,16 +208,18 @@ def default_band(volumes: list[dict]) -> dict | None:
                           [lat0 + GRID_CELL_DEG, lon0]])
     if not rings:
         return None
-    return {"id": "band-default-121", "name": "Part 107 기본 상한 (격자 밖)", "polygon": rings[0],
-            "rings": rings, "floor_m": 0.0, "ceiling_m": DEFAULT_CEILING_M, "reference": "AGL",
-            "rule": "ceiling", "reason": "시설 지도 격자가 없는 곳. 14 CFR 107.51 기본 상한 400ft",
+    return {"id": "band-default-121", "name": "Part 107 default ceiling (outside the grid)",
+            "polygon": rings[0], "rings": rings, "floor_m": 0.0,
+            "ceiling_m": DEFAULT_CEILING_M, "reference": "AGL", "rule": "ceiling",
+            "reason": "outside the facility map grid. 14 CFR 107.51 default ceiling 400 ft",
             "source": "14 CFR 107.51"}
 
 
 def load_volumes() -> list[dict]:
-    """FAA UAS Facility Map. 격자마다 허용 고도가 다릅니다.
+    """FAA UAS Facility Map. Every grid cell has its own allowed altitude.
 
-    천장 0ft 는 고도 제한이 아니라 '허가 없이는 못 난다'는 뜻이라 금지로 옮겨 담습니다.
+    A 0 ft ceiling is not an altitude limit but 'no flight without authorisation', so it is
+    carried over as forbidden.
     """
     try:
         return json.loads(Path(AIRSPACE_FILE).read_text(encoding="utf-8"))["volumes"]
@@ -218,9 +230,9 @@ def load_volumes() -> list[dict]:
 STANDING_VOLUMES = load_volumes()
 AIRSPACE_BANDS = load_bands()
 
-# 건물. 규정이 아니라 물체지만, 판정에서는 같은 모양입니다 — 땅에서 옥상까지 금지이고
-# 그 위는 열려 있습니다. Volume 하나로 그게 그대로 표현되므로 새 판정 코드가 없습니다.
-# scripts/fetch_buildings.py 가 뉴욕시 공개 데이터에서 받아옵니다.
+# Buildings. Objects rather than regulations, but the same shape to the judgement — forbidden
+# from the ground to the roof and open above. One Volume says exactly that, so there is no new
+# judging code. scripts/fetch_tile_buildings.mjs fetches them from the map tiles.
 BUILDING_FILE = os.getenv(
     "BUILDING_FILE",
     str(Path(__file__).resolve().parent.parent / "configs/airspace/nyc_buildings.json"),
@@ -228,7 +240,7 @@ BUILDING_FILE = os.getenv(
 
 
 def load_buildings() -> list[dict]:
-    """건물을 안 넣고 돌릴 수도 있어야 합니다 — 파일이 없으면 빈 목록입니다."""
+    """It must be possible to run without buildings — no file means an empty list."""
     if os.getenv("BUILDINGS", "1") == "0":
         return []
     try:
@@ -246,7 +258,7 @@ ADDRESS_FILE = os.getenv(
 
 
 def load_addresses() -> list[dict]:
-    """배달지는 실제 주소입니다. OpenStreetMap 에서 받아온 맨해튼 건물들입니다."""
+    """Delivery addresses are real: Manhattan buildings fetched from OpenStreetMap."""
     try:
         return json.loads(Path(ADDRESS_FILE).read_text(encoding="utf-8"))["addresses"]
     except (OSError, KeyError, json.JSONDecodeError):
@@ -255,21 +267,24 @@ def load_addresses() -> list[dict]:
 
 ADDRESSES = load_addresses()
 
-# 착륙장. 배달은 아무 주소가 아니라 지정된 드론 착륙장으로만 갑니다. 맨해튼 11곳 + 브루클린 3곳 +
-# 퀸스 2곳. 좌표는 공원·부두의 열린 자리이고, 착륙 지점 둘레 LANDING_SEPARATION_M 안에 건물이
-# 없고 순항 90m 로 이륙장과 왕복 길이 나는지 tests/test_cycle.py 가 봅니다.
-# 센트럴파크·미드타운 동쪽·칼슈어츠파크는 KLGA 0ft 격자 안이라(FAA 데이터) 착륙장이 될 수 없고,
-# 브라이언트파크·매디슨스퀘어는 둘레에 건물 없는 자리가 없거나 길이 안 났습니다.
-# 판 시작 때 정해 두는 첫 배달지. 01·03 의 직선은 미드타운 KLGA 0ft 격자를 관통합니다(우회 장면).
-# 02·04 는 자리 순서와 반대 방향으로 갑니다 — 서쪽 자리(02)는 북동쪽 맥캐런으로, 동쪽 자리(04)는
-# 북서쪽 콜리어스 훅으로. 두 직선이 자리에서 60m 쯤 북쪽에서 교차하고, 넷이 같은 틱에 뜨므로
-# 직결 세계에서는 두 대가 같은 순간 그 점을 지나 분리를 잃습니다. 런타임 세계는 같은 신청을
-# 교차로 거절하고 고도나 출발 시각을 바꿔 다시 냅니다 — 그 차이가 점수판의 separation_losses 입니다.
+# Landing sites. Deliveries go only to designated drone landing sites, never to any address:
+# 11 in Manhattan + 3 in Brooklyn + 2 in Queens. The coordinates are open spots in parks and on
+# piers; tests/test_cycle.py checks there is no building within LANDING_SEPARATION_M of the
+# touchdown point and that a 90 m cruise route to and from the pad exists.
+# Central Park, Midtown East and Carl Schurz Park are inside the KLGA 0 ft cells (FAA data) and
+# cannot be landing sites; Bryant Park and Madison Square had no building-free spot or no route.
+# The first stops, fixed at round start. The straight lines of 01 and 03 cut through the Midtown
+# KLGA 0 ft cells (the detour scene). 02 and 04 fly against their seat order — the west seat
+# (02) north-east to McCarren, the east seat (04) north-west to Corlears Hook. Their straight
+# lines cross about 60 m north of the seats, and all four lift off on the same tick, so in the
+# direct wiring two aircraft pass that point at the same moment and lose separation. The guarded
+# wiring refuses the same filings as crossing, and they are refiled with a new altitude or
+# departure time — that difference is separation_losses on the scoreboard.
 OPENING_STOPS = {"drone-01": "Central Park North 110th", "drone-02": "McCarren Park",
                  "drone-03": "Morningside Park", "drone-04": "Corlears Hook Park"}
 
 LANDING_AREAS = [
-    # 맨해튼 섬 (17)
+    # Manhattan island (17)
     {"id": "la-battery", "name": "Battery Park", "lat": 40.70335, "lon": -74.01565},
     {"id": "la-minuit", "name": "Peter Minuit Plaza", "lat": 40.70106, "lon": -74.01243},
     {"id": "la-seaport", "name": "Seaport Pier 17", "lat": 40.70620, "lon": -74.00110},
@@ -287,7 +302,7 @@ LANDING_AREAS = [
     {"id": "la-abzug", "name": "Bella Abzug Park", "lat": 40.75603, "lon": -74.00160},
     {"id": "la-pier76", "name": "Pier 76 Midtown", "lat": 40.75868, "lon": -74.00391},
     {"id": "la-pier84", "name": "Pier 84 Hudson", "lat": 40.76284, "lon": -74.00069},
-    # 센트럴파크 북쪽·할렘 (7). 공원 남쪽 절반은 KLGA 0ft 격자라 못 둡니다.
+    # North Central Park and Harlem (7). The park's southern half is in the KLGA 0 ft cells.
     {"id": "la-eastmeadow", "name": "Central Park East Meadow", "lat": 40.7887, "lon": -73.96},
     {"id": "la-northmeadow", "name": "Central Park North Meadow", "lat": 40.7935, "lon": -73.959},
     {"id": "la-harlemmeer", "name": "Harlem Meer", "lat": 40.79670, "lon": -73.95200},
@@ -295,7 +310,7 @@ LANDING_AREAS = [
     {"id": "la-morningside", "name": "Morningside Park", "lat": 40.804, "lon": -73.95824},
     {"id": "la-stnicholas", "name": "St. Nicholas Park", "lat": 40.81550, "lon": -73.94900},
     {"id": "la-jefferson", "name": "Thomas Jefferson Park", "lat": 40.79350, "lon": -73.93700},
-    # 브루클린·퀸스·거버너스 (6)
+    # Brooklyn, Queens, Governors Island (6)
     {"id": "la-bbp", "name": "Brooklyn Bridge Park", "lat": 40.70200, "lon": -73.99650},
     {"id": "la-governors", "name": "Governors Island", "lat": 40.68950, "lon": -74.01680},
     {"id": "la-mccarren", "name": "McCarren Park", "lat": 40.72060, "lon": -73.95200},
@@ -306,129 +321,106 @@ LANDING_AREAS = [
 
 
 def to_grid(lat: float, lon: float) -> tuple[float, float]:
-    """위경도를 격자로. to_latlon 의 역입니다."""
+    """Lat/lon to grid; the inverse of to_latlon."""
     return ((lon - ORIGIN_LON) / SPAN_LON * 100.0,
             (1.0 - (lat - ORIGIN_LAT) / SPAN_LAT) * 60.0)
 
 
-# 배달 서비스 반경. 4km 로는 배달지가 전부 로어맨해튼이라 FAA 0ft 격자(맨해튼 한가운데를
-# 지나는 붉은 띠)에 걸리는 경로가 안 나왔습니다. 11km 면 어퍼웨스트사이드까지 들어가고,
-# 그리로 가는 직선은 그 띠를 관통해 거절되고 우회로가 나옵니다 — 이 데모의 핵심 장면입니다.
-# 편도 10km 는 570틱이라 한 판(ROUND_TICKS)도 같이 늘렸습니다.
+# Delivery service radius. At 4 km every drop was in Lower Manhattan and no route touched the
+# FAA 0 ft cells (the red band across the middle of Manhattan). 11 km reaches the Upper West
+# Side, and a straight line there cuts through the band, is refused, and a detour comes back —
+# the key scene of this demo. 10 km one way is 570 ticks, so the round (ROUND_TICKS) grew too.
 SERVICE_RADIUS_M = 11_000.0
 
 
-_SERVICE_AREA: list[dict] | None = None
-
-
-def pickable_addresses() -> list[dict]:
-    """배달을 받을 수 있는 주소. 금지 구역 밖이고, 서비스 반경 안입니다.
-
-    공역(AIRSPACE)이 이 아래에서 만들어지므로 처음 부를 때 한 번만 셈합니다.
-    """
-    global _SERVICE_AREA
-    if _SERVICE_AREA is None:
-        _SERVICE_AREA = _within_service_area()
-    return _SERVICE_AREA
-
-
-def _within_service_area() -> list[dict]:
-    depot_lat, depot_lon = to_latlon(*DEPOT)
-    open_ones = []
-    for address in ADDRESSES:
-        # 금지 구역 안이거나 건물에 붙은 주소는 뺍니다. 마지막 구간이 이격 거리를 못 지켜
-        # 어떤 경로도 승인이 안 나고, 그러면 그 주문은 반려만 됩니다.
-        if AIRSPACE.too_close(address["lat"], address["lon"], 0.0):
-            continue
-        north = (address["lat"] - depot_lat) * 110_570.0
-        east = (address["lon"] - depot_lon) * 84_400.0   # 위도 40.7 도 기준
-        if (north * north + east * east) ** 0.5 > SERVICE_RADIUS_M:
-            continue
-        gx, gy = to_grid(address["lat"], address["lon"])
-        if 2 <= gx <= 98 and 2 <= gy <= 58:
-            open_ones.append({**address, "gx": gx, "gy": gy})
-    return open_ones
-
-
-
-# 병원 응급헬기가 뜬다고 갑자기 상공이 닫힙니다. 배달 항로 위에 섭니다 — 유일한 이륙장 위에
-# 두면 기단이 갈 곳이 없어져서, 규칙이 무엇을 막는지가 아니라 기체가 갇힌 것만 보였습니다.
-# 이게 리콜과 같은 얘기의 공간판입니다. 금지가 언제 도착하고 누가 강제하느냐.
-# 공지는 FAA 문장 그대로 나갑니다. 시뮬레이터는 폴리곤을 주지 않습니다 — 런타임이 문장을 읽어
-# 구역을 만들고, 못 읽으면 못 읽었다고 기록합니다. 실제 NOTAM 이 그렇게 옵니다.
-# 좌표는 DDMMSS 라 초 단위입니다: 404310N = 40°43'10", 0735920W = 73°59'20" (이스트빌리지).
-# 판의 시계: 틱 0 = 0900Z, 틱 하나 0.8초. 0907-0912Z 가 525~900틱입니다.
+# A hospital medevac helicopter launches and the airspace above suddenly closes. It sits on the
+# delivery routes — placed over the only pad it left the fleet nowhere to go, and all it showed
+# was trapped aircraft, not what the rule blocks.
+# This is the spatial version of the recall story: when a ban arrives and who enforces it.
+# The notice goes out as FAA text. The simulator gives no polygon — the runtime reads the text
+# to build the zone and, if it cannot, records that it could not. Real NOTAMs arrive that way.
+# Coordinates are DDMMSS, down to seconds: 404310N = 40°43'10", 0735920W = 73°59'20" (East
+# Village).
+# The round's clock: tick 0 = 0900Z, 0.8 s per tick. 0907-0912Z is ticks 525-900.
 CLOCK = Clock(epoch_z="0900", seconds_per_tick=SIM_SECONDS_PER_TICK)
 ZONE_TEXT = ("AREA BOUNDED BY 404310N0735920W 404310N0735855W 404332N0735855W 404332N0735920W "
              "SFC-400FT AGL 0907-0912Z")
 ZONE_NOTICE = parse_notice(ZONE_TEXT, CLOCK)
 ZONE_TICK = ZONE_NOTICE.from_tick
-ZONE_UNTIL = ZONE_NOTICE.until_tick   # 응급헬기가 뜨고 내리는 동안만. 구역에는 유효기간이 있습니다
+ZONE_UNTIL = ZONE_NOTICE.until_tick   # only while the medevac flies; zones expire
 ZONE = {
     "id": "nofly-2026-09-hospital",
     "kind": "notam",
-    "reason": "응급헬기 이착륙. 상공 비행금지",
-    "name": "이스트빌리지 응급헬기 회랑",
+    "reason": "medevac landing and departure. no flight overhead",
+    "name": "East Village medevac corridor",
     "text": ZONE_TEXT,
-    # 아래는 시뮬레이터 자신이 점수를 매기고 화면 바닥에 칠할 때 쓰는 값입니다. 공지에는 안 실립니다
-    # (bulletins 가 text 만 고릅니다).
+    # The values below are for the simulator's own scoring and ground painting on screen. They
+    # are not in the notice (bulletins picks only text).
     "polygon": [[lat, lon] for lat, lon in ZONE_NOTICE.polygon],
     "floor_m": ZONE_NOTICE.floor_m, "ceiling_m": ZONE_NOTICE.ceiling_m, "reference": "AGL",
-    "rule": "forbidden", "source": "예시 데이터",
+    "rule": "forbidden", "source": "sample data",
 }
-# 구역은 이 폴리곤 하나입니다. 예전에는 점수판이 따로 원(centre·radius)을 들고 있었는데,
-# 폴리곤을 브루클린으로 옮길 때 원은 안 옮겨져서 이스트강 한복판을 세고 있었습니다.
-# 런타임이 막는 곳, 점수판이 세는 곳, 화면이 그리는 곳이 같아야 합니다.
+# The zone is this one polygon. The scoreboard used to keep its own circle (centre, radius);
+# when the polygon moved to Brooklyn the circle did not, and it was counting the middle of the
+# East River. Where the runtime blocks, where the scoreboard counts and what the screen draws
+# must be the same place.
 ZONE_VOLUME = Volume.from_dict(ZONE)
-# 두 번째 공지는 문법이 못 읽는 문장입니다. 실제 NOTAM 도 서식 밖의 자유 문장으로 올 때가 있고,
-# 그때 런타임이 무엇을 하는지(모델이 구조화 → 사람 확인 전에는 아무것도 안 막음, 모델이 없으면
-# '못 읽음' 으로 기록)가 첫 공지와 다른 얘기입니다. 첫 구역이 걷힌 뒤(0912Z 이후)에 옵니다.
-# 반지름은 0.5NM — 모델이 지어낸 구역의 넓이 상한(core/notam.MAX_AREA_M2 4km²) 안이어야 사람 앞에
-# 갑니다. 좌표는 할렘 병원(레녹스 애비뉴·W 136th) 40°48'52"N 73°56'23"W.
+# The second notice is text the grammar cannot read. Real NOTAMs sometimes arrive as free text
+# outside the format, and what the runtime does then (a model structures it → nothing is
+# blocked until a human confirms; with no model it is recorded as 'unreadable') is a different
+# story from the first notice. It arrives after the first zone lifts (after 0912Z).
+# Radius 0.5 NM — a model-drafted zone must be within the area cap (core/notam.MAX_AREA_M2,
+# 4 km²) to reach a human. Coordinates: Harlem Hospital (Lenox Avenue & W 136th),
+# 40°48'52"N 73°56'23"W.
 MEDEVAC_TEXT = ("MEDEVAC INBOUND HARLEM HOSPITAL HELIPAD. KEEP CLEAR WITHIN 0.5 NM OF "
                 "404852N0735623W BELOW 400 FT AGL FROM 0918Z TO 0928Z")
-assert parse_notice(MEDEVAC_TEXT, CLOCK) is None, "두 번째 공지는 문법이 못 읽는 문장이어야 합니다"
+assert parse_notice(MEDEVAC_TEXT, CLOCK) is None, "the grammar must not parse the second notice"
 MEDEVAC_TICK = CLOCK.tick_of("0918")
 MEDEVAC_UNTIL = CLOCK.tick_of("0928")
 MEDEVAC = {
     "id": "nofly-2026-09-medevac",
     "kind": "notam",
-    "reason": "응급헬기 진입. 병원 헬리패드 주변 비행금지",
-    "name": "할렘 병원 응급헬기",
+    "reason": "medevac inbound. no flight around the hospital helipad",
+    "name": "Harlem Hospital medevac",
     "text": MEDEVAC_TEXT,
 }
-# 규제기관이 특정 기종의 운항을 세우는 지시. 배터리 관리 같은 운영사의 몫이 아니라,
-# 밖에서 도착해서 즉시 강제되어야 하는 규칙입니다 — 그게 런타임이 있는 이유입니다.
+# A regulator's directive grounding one aircraft model. Not the operator's business like
+# battery management, but a rule that arrives from outside and must be enforced at once —
+# which is why the runtime exists.
 RECALL = {
     "id": "ad-2026-09-dv-x500",
     "kind": "recall",
     "forbid_action": "fly_route",
     "applies_to": {"model": "dv-x500"},
-    "reason": "감항성 지시 — dv-x500 운항 정지",
+    "reason": "airworthiness directive — dv-x500 grounded",
 }
 RECALL_UNTIL = 1350
 
-# 날씨. METAR 어투의 관측 한 줄 — 런타임의 문법이 읽고 한도(configs/fleet.yaml weather)와
-# 비교합니다. 돌풍 28 kt(14.4 m/s)가 12 m/s 를 넘어 이륙 정지(WEATHER HOLD)가 걸립니다. 바람
-# 18 kt(9.3 m/s)와 시정 2 SM(3.2 km)은 한도 안 — 넘는 것 하나로 충분합니다. 0929Z = 틱 2175,
-# 창은 0936Z = 틱 2700 까지. 직결 세계는 이 문장을 읽을 곳이 없어 그대로 뜹니다 — 점수판
-# weather_hold_takeoffs 가 그것을 셉니다.
+# Weather. One METAR-style observation — the runtime's grammar reads it and compares it with
+# the limits (configs/fleet.yaml weather). The 28 kt gust (14.4 m/s) exceeds 12 m/s, so a
+# takeoff hold (WEATHER HOLD) applies. Wind 18 kt (9.3 m/s) and visibility 2 SM (3.2 km) are
+# within limits — one exceedance is enough. 0929Z = tick 2175; the window runs to 0936Z =
+# tick 2700. The direct wiring has nowhere to read this text and takes off anyway — the
+# scoreboard's weather_hold_takeoffs counts that.
 WEATHER_TEXT = "KNYC 0929Z WIND 240 AT 18 GUST 28 KT VIS 2SM RA"
 WEATHER_TICK = CLOCK.tick_of("0929")
 WEATHER_UNTIL = CLOCK.tick_of("0936")
 WEATHER = {
     "id": "wx-2026-09-knyc-0929",
     "kind": "weather",
-    "name": "KNYC 관측 0929Z",
-    "reason": "돌풍 28 kt — 소형 멀티로터 이륙 한도 밖",
+    "name": "KNYC observation 0929Z",
+    "reason": "gust 28 kt — outside the small multirotor takeoff limit",
     "text": WEATHER_TEXT,
 }
-# 사고. 실제 주소(configs/airspace/nyc_addresses.json)로 옵니다 — 런타임이 지명 사전에서 자리를 찾아
-# 반경만큼 금지 구역(원)을 만들고, 그 안(둘레 50 m 까지)의 착륙장은 쓸 수 없게 됩니다. 센터 불러바드
-# 4705 번지(롱아일랜드시티 강변 고층)는 갠트리플라자 착륙장에서 156 m — 150 m 원의 가장자리라 착륙
-# 둘레 50 m 에 걸립니다. 그리로 가는 승인 회랑은 회수되고 새 경로는 거절됩니다(test_runtime_intake).
-# 씨앗 7 의 지금 흐름(계획기 후보 중 모델이 고름)에서는 원이 닫힌 동안 그리로 가는 회랑이 없어
-# 회수·거절이 없습니다 — 하네스는 원이 닫힌 동안 승인된 경로가 모두 원을 비켜 가는지를 봅니다.
+# Incident. It arrives as a real address (configs/airspace/nyc_addresses.json) — the runtime
+# finds the spot in the gazetteer and makes a forbidden zone (a circle) of that radius, and
+# landing sites inside it (within 50 m of its edge) become unusable. 4705 Center Boulevard (a
+# Long Island City waterfront tower) is 156 m from the Gantry Plaza landing site — at the edge
+# of the 150 m circle, so within the 50 m landing margin. Cleared corridors there are recalled
+# and new routes refused (test_runtime_intake).
+# In seed 7's current flow (the model picks among planner candidates) no corridor goes there
+# while the circle is closed, so nothing is recalled or refused — the harness checks that every
+# cleared route avoids the circle while it is closed.
 INCIDENT_ADDRESS = "4705 Center Boulevard"
 INCIDENT_RADIUS_M = 150.0
 INCIDENT_TEXT = (f"FDNY 3-ALARM FIRE AT {INCIDENT_ADDRESS.upper()}. "
@@ -438,42 +430,44 @@ INCIDENT_UNTIL = 3600
 INCIDENT = {
     "id": "fdny-2026-09-center-blvd",
     "kind": "incident",
-    "name": "센터 불러바드 화재",
-    "reason": "FDNY 3-alarm fire — 상공 접근 금지",
+    "name": "Center Boulevard fire",
+    "reason": "FDNY 3-alarm fire — no flight overhead",
     "text": INCIDENT_TEXT,
     "address": INCIDENT_ADDRESS,
     "radius_m": INCIDENT_RADIUS_M,
 }
 
 
-# 링크 두절. 이 창에 떠서 승인 경로를 날던 기체 하나(이름 순으로 첫 기체)의 텔레메트리가 끊깁니다.
-# 기체는 운영사가 신고한 대비 행동(configs/fleet.yaml performance.lost_link: continue_and_land)대로
-# 마지막 경로를 그대로 날아 목적지에 내리고, 그동안 어떤 명령도 못 듣습니다. 시뮬레이터는 끊긴
-# 순간의 기록을 그대로 다시 내보냅니다 — 틱 도장(telemetry_tick)이 멈추고, 런타임은 그 도장으로
-# 두절을 압니다(끊겼다는 표시는 텔레메트리에 없습니다). 두 세계에 같은 규칙으로 일어나고, 직결
-# 세계에서는 그 기체의 남은 길을 아무도 잡아 두지 않습니다 — 누가 그리로 들어가면 점수판
-# link_lost_incursions 가 셉니다. 씨앗 7 에서는 두 세계 모두 drone-02 가 배달지로 가던
-# 중에 끊기고, 직결 세계에서는 그 창에 아무도 그 길을 지나지 않아 0 입니다. 그래서 이
-# 장면의 대조는 런타임 쪽의 행동입니다 — 예약한 공간으로 가는 신청이 오면 거절(dark_refusals;
-# 씨앗 7 에서는 그리로 가려던 신청이 없어 0), 끊긴 기체에 보낸 명령 0, 돌아왔을 때 승인한
-# 부피 안(links_nonconforming 0). 직결 쪽을
-# 억지로 들어가게 만들지는 않습니다.
+# Lost link. In this window, one aircraft airborne on a cleared route (the first by name) loses
+# its telemetry. It follows the contingency the operator declared (configs/fleet.yaml
+# performance.lost_link: continue_and_land): it flies its last route as is, lands at the
+# destination, and hears no command meanwhile. The simulator keeps re-publishing the record from
+# the moment the link dropped — the tick stamp (telemetry_tick) stops, and that stamp is how the
+# runtime detects the loss (the telemetry carries no lost-link flag). It happens by the same
+# rule in both worlds. In the direct wiring nobody reserves that aircraft's remaining path —
+# anyone who enters it is counted by the scoreboard's link_lost_incursions. In seed 7 drone-02
+# loses its link on the way to a drop in both worlds, and in the direct wiring nobody crosses
+# that path in the window, so it is 0. The contrast in this scene is therefore the runtime
+# side's behaviour: filings into the reserved space are refused (dark_refusals; 0 in seed 7, as
+# nobody tried to go there), 0 commands sent to the dark aircraft, and on return it is inside
+# the cleared volume (links_nonconforming 0). The direct side is not forced to intrude.
 # 3800 = 0950:40Z, 3950 = 0952:40Z.
 LINK_LOSS_TICK = 3800
 LINK_LOSS_UNTIL = 3950
-# 창의 앞쪽에서만 고릅니다. 늦게 끊기면 판정 시간(LINK_TIMEOUT_TICKS)보다 짧게 끊겨 장면이
-# 안 됩니다.
+# Pick only early in the window. A late loss would be shorter than the detection time
+# (LINK_TIMEOUT_TICKS) and there would be no scene.
 LINK_LOSS_PICK_TICKS = 50
-# 두절을 알 수 있는 시간. configs/fleet.yaml performance.lost_link.timeout_ticks 와 같아야 합니다
-# (tests/test_lost_link.py 가 대조). 끊긴 뒤 이만큼 안에 나간 승인은 두절을 모르고 낸 것이라,
-# 점수판은 그 뒤에 받은 경로만 셉니다 — 아무도 알 수 없던 것을 탓하지 않습니다.
+# Time until a lost link can be known. Must equal configs/fleet.yaml
+# performance.lost_link.timeout_ticks (tests/test_lost_link.py checks). Clearances issued within
+# this many ticks of the loss were issued without knowing, so the scoreboard counts only routes
+# received after it — nobody is blamed for what nobody could know.
 LINK_TIMEOUT_TICKS = 15
 LINK_FLYING = ("delivering", "returning", "approaching")
 
 
 def _address_coords(label: str) -> tuple[float, float]:
     found = next((a for a in ADDRESSES if a["label"] == label), None)
-    assert found is not None, f"지명 사전에 없는 주소 {label!r}"
+    assert found is not None, f"address not in the gazetteer: {label!r}"
     return float(found["lat"]), float(found["lon"])
 
 
@@ -485,10 +479,12 @@ AIRSPACE = Airspace()
 
 @functools.lru_cache(maxsize=1)
 def zone_exit_ticks(samples: int = 24) -> int:
-    """닫힌 구역 안 어디서든 가장 가까운 바깥(이격 포함, 런타임의 nearest_exit)까지 순항으로 몇 틱.
+    """Ticks at cruise from anywhere in the closed zone to its nearest outside (clearance
+    included; the runtime's nearest_exit).
 
-    구역 안을 촘촘히 짚어 가장 먼 자리를 씁니다. 회수가 닿는 틱과 끝자리 반올림으로 두 틱을
-    더합니다. 점수판은 닫힐 때 안에 있던 기체에게 이만큼을 줍니다 — 두 세계에 같게.
+    Samples the zone densely and uses the farthest spot, plus two ticks for the recall to arrive
+    and for rounding. The scoreboard gives this much to aircraft inside when the zone closes —
+    the same in both worlds.
     """
     lats = [point[0] for point in ZONE_VOLUME.polygon]
     lons = [point[1] for point in ZONE_VOLUME.polygon]
@@ -523,31 +519,34 @@ class Vehicle:
     charge_mode: str = "normal"
     spend: float = 0.0
     in_zone: bool = False
-    zone_grace_until: int = 0     # 닫힐 때 안에 있었으면 나갈 시간이 끝나는 틱
+    zone_grace_until: int = 0     # if inside at closing: the tick its time to leave runs out
     over_ceiling: bool = False
-    airborne: bool = False          # 지난 틱에 떠 있었나. 이륙(땅 → 공중)을 세는 데 씁니다
+    airborne: bool = False          # airborne last tick? Counts takeoffs (ground → air)
     in_incident: bool = False
     heading: float = 0.0
     cruise_alt: float = LOITER_ALT_M
-    job_label: str = ""            # 배달지 주소
+    job_label: str = ""            # delivery address
     job_x: float | None = None
     job_y: float | None = None
-    hold_ticks: int = 0             # 승인 확인 후 출발까지. 즉시 튀어나가지 않습니다
-    work_ticks: int = 0             # 싣거나 내리는 데 남은 시간
-    load: int = 0                   # 실린 상자 수. 화면에 그대로 쌓입니다
-    stops_left: int = 0             # 이번에 나가서 들를 착륙장 수
-    pickup: int = 0                 # 이 착륙장에서 받아 갈 상자 수
-    delivered: int = 0              # 다녀온 배달지 수
-    waypoints: list = field(default_factory=list)   # 승인된 경로. 없으면 못 움직입니다
-    # 출발을 미룬 승인. 운영사가 앞 기체의 회랑이 빌 때까지 기다리기로 하고 낸 경로입니다.
-    # 이 틱 전에는 지상에서 준비된 채 서 있고, 화면에는 누구를 기다리는지 씁니다.
+    hold_ticks: int = 0             # clearance check to departure; no instant launch
+    work_ticks: int = 0             # time left loading or unloading
+    load: int = 0                   # boxes on board, stacked as is on screen
+    stops_left: int = 0             # landing sites left to visit on this trip
+    pickup: int = 0                 # boxes to pick up at this landing site
+    delivered: int = 0              # drops completed
+    waypoints: list = field(default_factory=list)   # cleared route; without one it cannot move
+    # A clearance with a delayed departure: a route the operator filed choosing to wait until the
+    # aircraft ahead clears its corridor. Until this tick it stands ready on the ground, and the
+    # screen shows whom it is waiting for.
     depart_after: int = 0
     holding_for: str | None = None
-    # 링크가 끊겼나(시뮬레이터의 사실). 끊긴 기체는 명령을 못 듣고, 밖으로는 끊긴 순간의 기록이
-    # 나갑니다. 그 기록의 이 값은 끊기기 전 것이라 늘 False 입니다 — 런타임은 도장으로 압니다.
+    # Is the link lost (the simulator's truth)? A dark aircraft hears no commands, and the
+    # outside sees the record from the moment the link dropped. In that record this value
+    # predates the loss and is always False — the runtime knows from the stamp.
     link_lost: bool = False
-    # 지금 경로를 받은 틱. 두절 기체의 남은 길에 들어간 기체가 두절을 알 수 있던 뒤에 받은 경로로
-    # 날고 있는지를 점수판이 봅니다.
+    # Tick the current route was received. The scoreboard uses it to tell whether an aircraft
+    # entering a dark aircraft's remaining path was flying a route received after the loss was
+    # knowable.
     route_tick: int = -1
 
     def public(self) -> dict:
@@ -593,20 +592,23 @@ class Scoreboard:
     batteries_dead: int = 0
     actions: int = 0
     human_approvals: int = 0
-    # 두 기체가 같은 틱에 수평 30m·수직 25m 안에 든 일. 쌍마다 한 번(틱마다가 아니라).
+    # Two aircraft within 30 m horizontally and 25 m vertically on the same tick. Once per pair
+    # (not per tick).
     separation_losses: int = 0
-    # 떠 있는(내리는) 기체가 땅에 서 있는 기체의 30m·25m 안에 든 일. 착륙장 하나에 두 대.
+    # An airborne (descending) aircraft within 30 m / 25 m of one parked on the ground: two
+    # aircraft on one landing site.
     site_conflicts: int = 0
-    # 기상 대기(WEATHER 창) 중의 이륙. 런타임 세계는 0 — 땅에서 낸 신청이 전부 거절되고 아직 안 뜬
-    # 승인 경로는 물립니다. 창의 첫 틱은 세지 않습니다(그 틱에 게시된 문장을 같은 틱에 읽을 수는
-    # 없음).
+    # Takeoffs during a weather hold (the WEATHER window). 0 in the guarded wiring — every filing
+    # from the ground is refused and cleared routes not yet flown are withdrawn. The window's
+    # first tick is not counted (text posted on a tick cannot be read on that same tick).
     weather_hold_takeoffs: int = 0
-    # 사고 원(INCIDENT 창) 안으로 떠서 들어간 일. 기체마다 들어갈 때 한 번.
+    # Flying into the incident circle (the INCIDENT window). Once per aircraft per entry.
     incident_incursions: int = 0
-    # 링크가 끊긴 기체의 남은 회랑(지금 자리 → 남은 경유점 → 착륙 기둥, 옆 30m·위아래 25m) 안에,
-    # 두절을 알 수 있던 뒤(끊긴 틱 + LINK_TIMEOUT_TICKS)에 받은 경로로 떠서 들어간 일. 쌍마다 한 번.
-    # 런타임 세계는 0 이어야 합니다 — 끊긴 기체의 공간을 예약된 채로 두고 그리로 가는 신청을
-    # 거절하니까요.
+    # Flying into a dark aircraft's remaining corridor (current position → remaining waypoints
+    # → landing column; 30 m sideways, 25 m up and down) on a route received after the loss was
+    # knowable (loss tick + LINK_TIMEOUT_TICKS). Once per pair.
+    # Must be 0 in the guarded wiring — it keeps the dark aircraft's space reserved and refuses
+    # filings into it.
     link_lost_incursions: int = 0
 
     def public(self) -> dict:
@@ -618,10 +620,11 @@ class Scoreboard:
 
 for _raw in STANDING_VOLUMES:
     AIRSPACE.add(Volume.from_dict(_raw))
-# 건물은 옥상 위 이격까지 막습니다. 데이터 파일에는 옥상 높이만 있고, 규격은 여기서 붙입니다 —
-# 런타임은 이 목록을 그대로 받아 같은 기준으로 판정합니다. 이격은 기본 50 m 이고, 그 건물이 선
-# FAA 칸의 천장이 50 m 를 허락하지 않으면(61 m 칸의 30 m 건물) 40 m 미만 건물만 20 m 입니다
-# (geo.building_clearance_m). 칸은 위에서 먼저 넣었으므로 여기서 물을 수 있습니다.
+# A building blocks up to its roof clearance. The data file has only roof heights; the standard
+# is attached here — the runtime takes this list as is and judges by the same measure. The
+# clearance is 50 m by default; where the ceiling of the FAA cell the building stands in does
+# not allow 50 m (a 30 m building in a 61 m cell), buildings under 40 m get 20 m
+# (geo.building_clearance_m). The cells were added above, so they can be queried here.
 def _building_clearance(raw: dict) -> float:
     polygon = raw.get("polygon") or []
     if not polygon:
@@ -631,19 +634,20 @@ def _building_clearance(raw: dict) -> float:
     return building_clearance_m(raw.get("ceiling_m"), AIRSPACE.ceiling_at(lat, lon))
 
 
-# 이격은 건물을 넣기 전에 한꺼번에 계산합니다. 넣으면서 물으면 동마다 색인이 다시 만들어져
-# (3만 4천 동 × 색인 재구성) 불러오기가 몇 시간이 됩니다.
+# Clearances are computed all at once before the buildings go in. Querying while adding would
+# rebuild the index per building (34,000 buildings × an index rebuild): hours of loading.
 _CLEARANCES = [_building_clearance(_raw) for _raw in BUILDINGS]
 for _raw, _clearance in zip(BUILDINGS, _CLEARANCES, strict=True):
     AIRSPACE.add(Volume.from_dict({**_raw, "clearance_m": _clearance}))
 
 
 def fresh_fleet(seed: int) -> list[Vehicle]:
-    """양쪽 세계가 똑같은 상태에서 출발합니다. 다른 건 배선뿐입니다.
+    """Both worlds start from exactly the same state. Only the wiring differs.
 
-    네 대가 이륙장에서 상자를 싣는 장면이 첫 화면입니다. 기종은 반반 — 감항성 지시가
-    한 기종에만 걸리므로 '같은 기단인데 절반만 멈춘다'가 보입니다. 이륙장이 하나라
-    돌아올 때 경쟁이 생기고, 잠금표와 중재가 걸리는 자리가 그것입니다.
+    The opening screen is four aircraft loading boxes at the pad. Half and half by model — the
+    airworthiness directive hits one model only, so 'same fleet, only half stops' shows. With a
+    single pad there is contention on return, and that is where the lock table and arbitration
+    come in.
     """
     rng = random.Random(seed)
     fleet = []
@@ -664,25 +668,26 @@ class World:
                  require_receipt: bool = False, agent_model: str | None = None):
         self.name = name
         self.fleet_limit = fleet_limit
-        # 이 세계의 기체를 모는 에이전트의 모델 id(빈 문자열 = 규칙). 직결 세계는 런타임에 등록할
-        # 길이 없어서(compose 에서 망이 다름) 띄운 쪽이 알려 준 값을 기체마다 싣습니다. None 이면
-        # 모르는 것이라 싣지 않습니다 — 런타임 세계는 런타임의 /state.agents 가 압니다.
+        # Model id of the agents flying this world's aircraft (empty string = rules). The direct
+        # wiring has no path to register with the runtime (a different network in compose), so
+        # the value the launcher passed is stamped on each aircraft. None means unknown and is
+        # not stamped — for the guarded wiring, the runtime's /state.agents knows.
         self.agent_model = agent_model
-        # 링크가 끊긴 기체: {기체: {"since": 끊긴 틱, "record": 끊기기 전 마지막 기록}}
+        # Dark aircraft: {aircraft: {"since": loss tick, "record": last record before the loss}}
         self.dark: dict[str, dict] = {}
         self._link_scene_done = False
         self._dark_close: set[frozenset] = set()
-        # 조종장치가 원장 번호를 요구하는가.
-        # 요구하면 런타임을 안 거친 명령은 물리적으로 실행되지 않습니다.
-        # 이 한 줄이 "권고"와 "강제"를 가릅니다.
+        # Does the actuator demand a ledger id?
+        # If so, a command that did not go through the runtime physically cannot execute.
+        # This one line is the difference between "advisory" and "enforced".
         self.require_receipt = require_receipt
         self._rng = random.Random(seed + 991)
         self.vehicles = {v.id: v for v in fresh_fleet(seed)}
         for vehicle in self.vehicles.values():
             self._assign_job(vehicle)
-        # 판의 첫 배달은 정해진 곳으로. 첫 정차가 무작위면 "브루클린에서 할렘까지 직선을 내고
-        # 미드타운 0ft 격자에 거절당해 돌아가는" 장면이 한 판에 안 나올 수 있습니다.
-        # 두 세계에 똑같이 적용되고, 그 뒤 정차는 무작위입니다.
+        # The round's first deliveries go to fixed sites. With a random first stop the scene
+        # "file a straight line from Brooklyn to Harlem, get refused at the Midtown 0 ft cells,
+        # detour" might not happen in a round. Same for both worlds; later stops are random.
         for asset_id, name in OPENING_STOPS.items():
             vehicle = self.vehicles.get(asset_id)
             area = next((a for a in LANDING_AREAS if a["name"] == name), None)
@@ -691,11 +696,11 @@ class World:
                 vehicle.job_x, vehicle.job_y = to_grid(area["lat"], area["lon"])
         self.score = Scoreboard()
         self.events: list[dict] = []
-        # 지금 분리를 잃은 채인 쌍. 쌍마다 한 번만 세려고 기억합니다.
+        # Pairs currently without separation, remembered so each pair counts once.
         self._too_close: set[frozenset] = set()
         self._site_close: set[frozenset] = set()
 
-    # ---------- 조종장치. 시키는 대로 합니다 ----------
+    # ---------- the actuator: does what it is told ----------
 
     def act(self, asset: str, action: str, params: dict, ledger_id: str | None,
             blast: str, approved_by: str | None, tick: int) -> dict:
@@ -705,13 +710,12 @@ class World:
         if action not in COSTS:
             return {"ok": False, "error": f"unknown action {action}"}
         if vehicle.link_lost:
-            # 링크가 끊긴 기체에는 아무 명령도 닿지 않습니다. 돈도 안 나가고 실행으로 세지도
-            # 않습니다.
+            # No command reaches a dark aircraft. Nothing is spent and nothing counts as run.
             return {"ok": False, "error": "link lost — the aircraft cannot hear commands"}
 
         if self.require_receipt and not ledger_id:
             self.score.refused_without_receipt += 1
-            return {"ok": False, "error": "승인 영수증(ledger id) 없이는 실행하지 않습니다"}
+            return {"ok": False, "error": "nothing runs without an approval receipt (ledger id)"}
 
         refusal = self._refuse(vehicle, action, params)
         if refusal:
@@ -730,35 +734,37 @@ class World:
             and vehicle.model == RECALL["applies_to"]["model"]
         ):
             self.score.post_recall_violations += 1
-            self._log(tick, "지시 위반", f"{asset} 가 운항 정지 지시 이후 비행")
+            self._log(tick, "directive breached", f"{asset} flew after the grounding directive")
 
         cost = COSTS[action]
         vehicle.spend += cost
         self.score.spend_usd += cost
-        # 기단 한도는 운영사 설정입니다. 없으면(None) 넘을 것도 없습니다.
+        # The fleet limit is an operator setting. With none (None) there is nothing to exceed.
         if self.fleet_limit is not None and self.score.spend_usd > self.fleet_limit:
             self.score.over_fleet_limit_usd = self.score.spend_usd - self.fleet_limit
 
         if action == "decline_job":
-            # 규정상 갈 수 없는 주소입니다. 주문을 반려하고 다음 건을 받습니다.
-            # 이것도 결정이고 기록에 남습니다 — 어느 주소가 왜 배달 불가인지가 쌓입니다.
-            # 가던 비행도 여기서 끝납니다. 경유점을 남겨두면 옛 목적지까지 날아간 뒤
-            # 새 주문 쪽으로 승인 없이 이어서 갑니다 — 실제로 그러고 있었습니다.
+            # An address the rules make unreachable. Decline the order and take the next one.
+            # That is a decision too, and it is recorded — which addresses cannot be served,
+            # and why, builds up. Any flight in progress ends here as well: with waypoints left,
+            # the aircraft flew to the old destination and went on to the new order without
+            # clearance — it really did.
             self.score.declined += 1
-            self._log(tick, "배달 불가", f"{vehicle.job_label} — 규정상 경로 없음")
+            self._log(tick, "delivery declined", f"{vehicle.job_label} — no legal route")
             vehicle.waypoints = []
             vehicle.depart_after, vehicle.holding_for = 0, None
             if vehicle.state not in GROUND_WORK:
                 vehicle.state = self._idle_state(vehicle)
-            # 들를 곳이 남았으면 다른 착륙장을, 아니면 다시 창고입니다. 예전에는 여기서
-            # 새 주문을 받아 빈 채로 배달지로 날아갔습니다.
+            # Another landing site if stops remain, else back to the depot. This used to take a
+            # new order here and fly to the drop empty.
             if vehicle.stops_left > 0:
                 self._assign_job(vehicle)
             else:
                 self._send_home(vehicle)
         elif action == "fly_route":
-            # 승인된 경로. 경유점이 있으면 그대로 따라갑니다.
-            # 없으면 목적지까지 직선입니다 — 그게 오른쪽 세계가 하는 일입니다.
+            # A cleared route: follow its waypoints if there are any.
+            # Without them it is a straight line to the destination — which is what the
+            # right-hand world does.
             vehicle.waypoints = self._to_waypoints(params.get("legs"), vehicle)
             vehicle.route_tick = tick
             vehicle.assigned_pad = None
@@ -766,11 +772,11 @@ class World:
             self._delay_departure(vehicle, params)
             if not vehicle.waypoints:
                 vehicle.cruise_alt = float(params.get("alt_m") or CRUISE_ALT_M)
-            # 지상에서 싣거나 내리는 중이면 상태는 그대로입니다. 일이 끝나고 승인 확인이
-            # 끝나면 ready 가 띄웁니다. 그래서 출발은 언제나 지상에서, 일하던 자리에서 일어납니다.
-            # 땅에 있는 다른 상태(landed·cruising)도 ready 를 거칩니다 — 승인 확인과 미룬 출발
-            # (depart_after)은 ready 만 지키므로, 거기서 바로 delivering 이 되면 미룬 출발이
-            # 무시됩니다.
+            # Loading or unloading on the ground: the state stays. Once the work and the
+            # clearance check are done, ready takes off — so departure always happens on the
+            # ground, where the work was done. Other ground states (landed, cruising) also go
+            # through ready — only ready honours the clearance check and a delayed departure
+            # (depart_after), so turning straight into delivering would skip the delay.
             if vehicle.state not in GROUND_WORK:
                 vehicle.state = self._idle_state(vehicle) if vehicle.alt <= 1.0 else (
                     "returning" if vehicle.stops_left <= 0 else "delivering")
@@ -780,7 +786,7 @@ class World:
             vehicle.waypoints = self._to_waypoints(params.get("legs"), vehicle)
             vehicle.route_tick = tick
             self._delay_departure(vehicle, params)
-            # 승인된 순항 고도. 안 주면 기본값으로 납니다 — 그게 규정 위반일 수 있습니다.
+            # Cleared cruise altitude. Without one it flies the default, which may break the rules.
             vehicle.cruise_alt = float(params.get("alt_m") or CRUISE_ALT_M)
             if vehicle.state not in GROUND_WORK:
                 vehicle.state = "ready" if vehicle.alt <= 1.0 else "approaching"
@@ -788,8 +794,9 @@ class World:
             vehicle.state = "charging"
             vehicle.charge_mode = "fast" if action == "fast_charge" else "normal"
         elif action == "depart":
-            # 뜨기 전에 싣습니다. 남아 있던 상자 위에 여섯 개까지 채웁니다.
-            # 새 주문도 여기서 받습니다 — 안 받으면 다 싣고도 갈 곳이 없어 다시 싣기만 반복합니다.
+            # Load before takeoff: top up to six on top of any boxes left aboard.
+            # Take the new order here too — otherwise, fully loaded with nowhere to go, it would
+            # just keep reloading.
             vehicle.assigned_pad = None
             vehicle.state = "loading"
             vehicle.stops_left = STOPS_PER_TRIP
@@ -798,13 +805,14 @@ class World:
             vehicle.load = min(PARCELS_PER_TRIP, max(0, vehicle.load))
             vehicle.work_ticks = (PARCELS_PER_TRIP - vehicle.load) * BOX_TICKS
             vehicle.cruise_alt = LOITER_ALT_M
-            vehicle.waypoints = []   # 다 쓴 경로입니다
+            vehicle.waypoints = []   # the route is used up
             vehicle.depart_after, vehicle.holding_for = 0, None
-            vehicle.vibration = 0.0  # 패드에 있는 동안 정비를 받았습니다
+            vehicle.vibration = 0.0  # serviced while on the pad
         elif action == "divert_ground":
-            # 승인됐던 경로를 회수합니다. 경유점을 남겨두면 회수 명령을 받고도 원래 목적지로
-            # 계속 날아갑니다 — 구역이 닫혔는데 그 안으로 들어가던 게 그래서였습니다.
-            # 닫힌 구역 안에 있었으면 런타임이 준 가장 가까운 바깥 자리까지만 나가서 기다립니다.
+            # Recall the cleared route. With waypoints left, an aircraft kept flying to its
+            # original destination despite the recall — that is why aircraft flew into a closed
+            # zone. If inside a closed zone, fly only to the nearest outside point the runtime
+            # gave, and wait there.
             vehicle.assigned_pad = None
             vehicle.waypoints = []
             vehicle.depart_after, vehicle.holding_for = 0, None
@@ -825,10 +833,11 @@ class World:
 
     @staticmethod
     def _idle_state(vehicle: Vehicle) -> str:
-        """갈 곳을 잃은 기체의 상태. 떠 있으면 제자리 대기(cruising), 땅이면 ready.
+        """Nowhere to go: cruising (hold in place) if airborne, ready if on the ground.
 
-        땅에 있는 기체를 cruising 으로 두면 _hold_altitude 가 순항 고도까지 스스로 올려서, 승인
-        없이 뜬 채 떠 있었습니다. 어디로 가는 것도 행동이고 뜨는 것도 행동입니다.
+        An aircraft on the ground left as cruising was lifted to cruise altitude by
+        _hold_altitude and hovered there without clearance. Going anywhere is an action, and so
+        is taking off.
         """
         return "cruising" if vehicle.alt > 1.0 else "ready"
 
@@ -844,9 +853,9 @@ class World:
 
     @staticmethod
     def _delay_departure(vehicle: Vehicle, params: dict) -> None:
-        """운영사가 출발을 미뤘으면(depart_after_tick) 그 틱까지 지상에서 준비된 채 기다립니다.
+        """A delayed departure (depart_after_tick) waits ready on the ground until that tick.
 
-        조종장치는 왜 미루는지 모릅니다. 화면에 쓸 이름(holding_for)만 같이 받아 둡니다.
+        The actuator does not know why. It only keeps the name to show on screen (holding_for).
         """
         after = params.get("depart_after_tick")
         vehicle.depart_after = int(after) if after else 0
@@ -855,7 +864,7 @@ class World:
 
     @staticmethod
     def _refuse(vehicle: Vehicle, action: str, params: dict) -> dict | None:
-        """물리적으로 불가능한 명령. 돈도 안 나가고 세지도 않습니다."""
+        """Physically impossible commands. Nothing is spent and nothing is counted."""
         if action == "reserve_pad" and params.get("pad") not in PADS:
             return {"ok": False, "error": f"unknown pad {params.get('pad')}"}
         if action == "depart" and vehicle.alt > 1.0:
@@ -868,10 +877,10 @@ class World:
             return {"ok": False, "error": "battery is dead"}
         return None
 
-    # ---------- 시간 ----------
+    # ---------- time ----------
 
     def tick(self, tick: int) -> None:
-        # 끊기는 것은 움직이기 전에 — 밖으로 나가는 마지막 기록이 지난 틱의 것이어야 합니다.
+        # Drop the link before moving — the last record published must be the previous tick's.
         self._script_link_loss(tick)
         for vehicle in self.vehicles.values():
             self._advance(vehicle, tick)
@@ -883,19 +892,20 @@ class World:
         self._detect_incident_incursions(tick)
         self._detect_link_lost_incursions(tick)
 
-    # ---------- 링크 두절 ----------
+    # ---------- lost link ----------
 
     def _script_link_loss(self, tick: int) -> None:
-        """창이 열리면 떠서 승인 경로를 날던 첫 기체의 링크를 끊고, 창이 닫히면 되돌립니다.
+        """When the window opens, drop the link of the first aircraft airborne on a cleared
+        route; restore it when the window closes.
 
-        끊긴 기체는 그대로 납니다 — _advance 가 남은 경유점을 따라 목적지에 내립니다
-        (continue_and_land). 바뀌는 것은 두 가지뿐: 명령이 안 닿고(act), 밖으로 나가는 기록이
-        끊긴 순간에 멈춥니다(snapshot).
+        The dark aircraft keeps flying — _advance follows the remaining waypoints and lands at
+        the destination (continue_and_land). Only two things change: commands do not reach it
+        (act), and the published record freezes at the moment of the loss (snapshot).
         """
         if tick >= LINK_LOSS_UNTIL and self.dark:
             for vid in list(self.dark):
                 self.vehicles[vid].link_lost = False
-                self._log(tick, "링크 복구", f"{vid} 텔레메트리가 다시 들어옴")
+                self._log(tick, "link restored", f"{vid} telemetry is coming in again")
             self.dark.clear()
         if self._link_scene_done or not (
                 LINK_LOSS_TICK <= tick < LINK_LOSS_TICK + LINK_LOSS_PICK_TICKS):
@@ -904,18 +914,22 @@ class World:
                        if v.alt > 1.0 and v.waypoints and v.state in LINK_FLYING), None)
         if flying is None:
             return
-        # 지난 틱의 기록을 끊기 전에 떠 둡니다. 도장은 지난 틱 — 이 틱부터 새 기록이 없습니다.
+        # Copy the previous tick's record before cutting. The stamp is the previous tick — from
+        # this tick on there are no new records.
         self.dark[flying.id] = {"since": tick,
                                 "record": {**flying.public(), "telemetry_tick": tick - 1}}
         flying.link_lost = True
         self._link_scene_done = True
-        self._log(tick, "링크 두절", f"{flying.id} 텔레메트리 끊김 — 승인 경로대로 날아 내림")
+        self._log(tick, "lost link",
+                  f"{flying.id} telemetry stopped — flying the cleared route down")
 
     @staticmethod
     def _remaining_corridor(vehicle: Vehicle) -> tuple[list, tuple]:
-        """끊긴 기체가 아직 지날 곳. 미터 평면의 ([(a, b, 고도)], (착륙 자리, 기둥 꼭대기)).
+        """Where the dark aircraft has yet to go, on the metre plane: ([(a, b, altitude)],
+        (landing spot, top of the column)).
 
-        지금 자리 → 남은 경유점(그 구간의 승인 고도) → 끝점의 착륙 기둥. 지나온 길은 빈 하늘입니다.
+        Current position → remaining waypoints (at each leg's cleared altitude) → the landing
+        column at the end. The path already flown is empty sky.
         """
         here = (vehicle.x * METRES_PER_CELL_X, vehicle.y * METRES_PER_CELL_Y)
         top = vehicle.alt
@@ -941,10 +955,9 @@ class World:
         return math.dist(point, at) < TRAFFIC_LATERAL_M and other.alt < top + TRAFFIC_VERTICAL_M
 
     def _detect_link_lost_incursions(self, tick: int) -> None:
-        """끊긴 기체의 남은 회랑 안에 떠 있는 다른 기체. 두절을 알 수 있던 뒤에 받은 경로로 날고
-        있을 때만, 쌍마다 들어갈 때 한 번. 끊긴 기체가 내려앉으면 그 기체의 하늘은 끝납니다(서 있는
-        자리는
-        site_conflicts 가 셉니다)."""
+        """Other aircraft airborne inside a dark aircraft's remaining corridor — only when flying
+        a route received after the loss was knowable, once per pair on entry. When the dark
+        aircraft touches down its sky ends (its spot on the ground is counted by site_conflicts)."""
         inside: set[frozenset] = set()
         for vid, info in self.dark.items():
             dark = self.vehicles[vid]
@@ -959,12 +972,12 @@ class World:
                     inside.add(frozenset((vid, other.id)))
         for pair in inside - self._dark_close:
             self.score.link_lost_incursions += 1
-            self._log(tick, "두절 기체 회랑 침범", f"{' · '.join(sorted(pair))}")
+            self._log(tick, "dark aircraft in a corridor", f"{' · '.join(sorted(pair))}")
         self._dark_close = inside
 
     def _published(self, vehicle: Vehicle, tick: int) -> dict:
-        """밖으로 내보내는 텔레메트리 한 줄. 새 기록에는 이 틱의 도장이 찍히고, 링크가 끊긴 기체는
-        끊기기 전 마지막 기록이 도장째 그대로 나갑니다."""
+        """One published telemetry record. A fresh record is stamped with this tick; for a dark
+        aircraft the last record before the loss goes out as is, stamp and all."""
         dark = self.dark.get(vehicle.id)
         record = dict(dark["record"]) if dark else {**vehicle.public(), "telemetry_tick": tick}
         if self.agent_model is not None:
@@ -973,21 +986,22 @@ class World:
 
     def _advance(self, vehicle: Vehicle, tick: int) -> None:
         if vehicle.state in ("dropping", "loading", "picking"):
-            # 지상. 상자가 BOX_TICKS 마다 하나씩 실리거나 내려집니다. 땅에서는 배터리가 안 닳습니다.
+            # On the ground. A box goes on or off every BOX_TICKS. No battery drain on the ground.
             vehicle.work_ticks -= 1
             if vehicle.state == "loading":
-                # 남은 시간을 상자 단위로 올림해서 뺍니다. 첫 상자는 BOX_TICKS 가 지나야 실립니다.
+                # Round the time left up to whole boxes. The first box is aboard after BOX_TICKS.
                 remaining_boxes = -(-max(0, vehicle.work_ticks) // BOX_TICKS)
                 vehicle.load = max(vehicle.load, PARCELS_PER_TRIP - remaining_boxes)
             elif vehicle.work_ticks % BOX_TICKS == 0:
                 vehicle.load = (max(0, vehicle.load - 1) if vehicle.state == "dropping"
                                 else min(PARCELS_PER_TRIP, vehicle.load + 1))
-            # 승인 확인은 일하는 동안 같이 흐릅니다. 일이 끝나고 다시 세면 그만큼 더 서 있습니다.
+            # The clearance check runs down during the work. Counting it again afterwards would
+            # keep the aircraft standing that much longer.
             if vehicle.hold_ticks > 0:
                 vehicle.hold_ticks -= 1
             if vehicle.work_ticks <= 0:
                 if vehicle.state == "dropping" and vehicle.pickup > 0:
-                    # 내린 자리에서 돌아갈 상자를 받습니다.
+                    # Pick up the return boxes where it just unloaded.
                     vehicle.state = "picking"
                     vehicle.work_ticks = vehicle.pickup * BOX_TICKS
                     vehicle.pickup = 0
@@ -995,23 +1009,24 @@ class World:
                     vehicle.state = "ready"
             return
         if vehicle.state == "ready":
-            # 지상. 다 실었거나 다 내렸습니다. 갈 곳이 승인되고 확인이 끝나야 뜹니다 —
-            # 그 전까지는 자리에서 기다리고, 화면에는 무엇을 기다리는지 씁니다.
+            # On the ground, fully loaded or unloaded. It takes off only once a destination is
+            # cleared and the check is done — until then it waits in place, and the screen shows
+            # what it is waiting for.
             if vehicle.hold_ticks > 0:
                 vehicle.hold_ticks -= 1
                 return
             if vehicle.waypoints and tick < vehicle.depart_after:
-                return   # 미룬 출발. 앞 기체의 회랑이 빌 때까지 준비된 채 섭니다
+                return   # delayed departure: stand ready until the corridor ahead clears
             vehicle.depart_after, vehicle.holding_for = 0, None
             if vehicle.assigned_pad:
                 vehicle.state = "approaching"
             elif vehicle.waypoints:
-                # 들를 곳이 없으면 창고로 돌아가는 비행입니다. 받아 온 상자만 싣고 갑니다.
+                # No stops left: the flight back to the depot, with only the picked-up boxes.
                 vehicle.state = "returning" if vehicle.stops_left <= 0 else "delivering"
             return
         if vehicle.hold_ticks > 0:
-            # 승인 확인은 지상에서만 합니다. 공중에서 멈춰 서면 그 자리에 붙박이가 되고,
-            # 마침 닫힌 구역 위였다면 거기 그대로 머물게 됩니다 — 실제로 그랬습니다.
+            # The clearance check happens on the ground only. Stopping in the air pins the
+            # aircraft in place, and over a closed zone it would stay there — it really did.
             if vehicle.alt > 1.0:
                 vehicle.hold_ticks = 0
             else:
@@ -1027,48 +1042,49 @@ class World:
             self._hold_altitude(vehicle, (vehicle.x, vehicle.y))
             if vehicle.alt <= 1.0:
                 if vehicle.assigned_pad:
-                    vehicle.state = "landed"      # 이륙장. 충전하고 다시 싣습니다
+                    vehicle.state = "landed"      # the pad: charge and reload
                 else:
-                    self._touch_down(vehicle, tick)   # 배달지. 상자를 내립니다
+                    self._touch_down(vehicle, tick)   # a drop: unload the boxes
             return
         if vehicle.state in ("stranded", "diverted", "grounded"):
             vehicle.alt = max(0.0, vehicle.alt - DESCENT_RATE_M)
             return
-        # 나는 동안만 닳습니다. 방전으로 멈추는 줄거리는 뺐습니다 — 항속 35분에 한 판 6분이라
-        # 실제로는 안 일어나고, 일어나면 그건 보여줄 것이 아니라 잡음입니다.
+        # Drains only in flight. The dead-battery storyline is gone — with 35 min endurance and
+        # a 6 min round it never really happens, and if it did it would be noise, not a scene.
         if vehicle.state == "landed" and not vehicle.waypoints:
             vehicle.alt = max(0.0, vehicle.alt - DESCENT_RATE_M)
             return
         vehicle.battery = max(1.0, vehicle.battery - BATTERY_PER_TICK)
-        # 모터 진동·자율주행 고장 줄거리도 뺐습니다. 배달 가던 기체가 정비하러 되돌아오거나
-        # 공중에서 멈춰 서는 장면이 됐고, 그건 런타임이 아니라 운영사 정비의 몫입니다.
-        # 사람 승인 경로(disengage_autonomy)는 tests/test_mechanisms.py 가 따로 봅니다.
+        # The motor-vibration and autonomy-failure storylines are gone too. They turned into
+        # aircraft heading back for maintenance mid-delivery or stopping in mid-air — the
+        # operator's maintenance business, not the runtime's. The human-approval path
+        # (disengage_autonomy) is covered separately by tests/test_mechanisms.py.
 
-        # 승인된 목적지가 없으면 제자리에 뜬 채 기다립니다.
-        # 어디로 가는 것도 행동이고, 행동은 승인을 받아야 합니다.
+        # With no cleared destination, hover in place and wait.
+        # Going anywhere is an action, and actions need clearance.
         target = self._current_target(vehicle)
         if target is None:
-            # 땅에 있고 갈 곳이 없으면 땅에 있습니다. 뜨는 것은 승인된 경로가 시킵니다.
+            # On the ground with nowhere to go: stay there. Only a cleared route lifts off.
             if vehicle.alt > 1.0:
                 self._hold_altitude(vehicle, (vehicle.x, vehicle.y))
             return
         if vehicle.waypoints:
             vehicle.cruise_alt = vehicle.waypoints[0][2]
-        # 멀티로터는 수직으로 올라간 다음 갑니다. 올라가면서 앞으로 나가면 승인받은
-        # 순항 고도보다 낮은 채로 건물 사이를 지나게 됩니다 — 경로는 통과인데 기체는
-        # 위반하는 상태가 됩니다. 실제 배달 드론도 뜨고 나서 이동합니다.
+        # A multirotor climbs vertically, then goes. Moving forward while climbing would pass
+        # between buildings below the cleared cruise altitude — the route passes but the
+        # aircraft is in violation. Real delivery drones also climb first, then travel.
         if not self._at_cruise(vehicle, target):
             self._hold_altitude(vehicle, target)
             return
         self._move_toward(vehicle, target)
         self._hold_altitude(vehicle, target)
         if vehicle.waypoints and self._at(vehicle, target):
-            vehicle.waypoints.pop(0)   # 이 구간 끝. 다음 구간으로
+            vehicle.waypoints.pop(0)   # end of this leg; on to the next
             return
         flying_in = vehicle.state in ("delivering", "returning", "approaching")
         if flying_in and self._at(vehicle, target):
-            # 도착점 위에 왔습니다. 여기서부터 수직으로 내려앉습니다 — 배달지든 이륙장이든.
-            # 공중에서 내려놓지 않습니다. 착륙하고, 내리고, 다시 뜹니다.
+            # Over the destination. From here it descends vertically — drop or pad alike.
+            # Nothing is released in mid-air: land, unload, take off again.
             vehicle.state = "landing"
 
     @staticmethod
@@ -1078,26 +1094,30 @@ class World:
         if vehicle.assigned_pad:
             return PADS[vehicle.assigned_pad]
         if vehicle.state in ("delivering", "returning") and vehicle.job_x is not None:
-            # 경유점 없이 목적지로 직행하는 배선. 조종장치는 승인을 안 봅니다 —
-            # 그래서 직결 쪽은 이렇게 날고, 그게 두 세계가 갈리는 자리입니다.
+            # The wiring that flies straight to the destination with no waypoints. The actuator
+            # does not check clearances — so the direct side flies like this, and that is where
+            # the two worlds part.
             return (vehicle.job_x, vehicle.job_y)
         return None
 
     def _touch_down(self, vehicle: Vehicle, tick: int) -> None:
-        """내려앉았습니다. 착륙장이면 상자를 내리고 돌아갈 상자를 받고, 창고면 가져온 것을 내립니다.
+        """Touched down. At a landing site: unload and pick up return boxes; at the depot:
+        unload what it brought.
 
-        다음 갈 곳은 내리기 전에 정해 둡니다. 그래야 운영사가 내리는 동안 다음 경로를
-        신청하고, 일이 끝난 기체가 그 자리에서 승인을 기다리며 서 있지 않습니다.
-        마지막 착륙장을 들른 기체의 다음 갈 곳은 창고 마당이고, 마당에 닿으면 갈 곳이
-        없어지는데 — 그때 운영사가 다음 짐(depart)이나 충전대를 신청합니다.
+        The next destination is set before unloading, so the operator files the next route
+        while it unloads and an aircraft done with its work does not stand waiting for a
+        clearance. After its last landing site an aircraft's next destination is the depot
+        yard; on reaching the yard it has nowhere to go — and that is when the operator files
+        for the next load (depart) or the charger.
         """
         if vehicle.job_label == "Warehouse" or vehicle.stops_left <= 0:
-            self._log(tick, "창고 도착", f"{vehicle.id} 가져온 상자 {vehicle.load}개")
+            self._log(tick, "at the warehouse",
+                      f"{vehicle.id} brought back {plural(vehicle.load, 'box', 'boxes')}")
             vehicle.job_x = vehicle.job_y = None
             vehicle.job_label = ""
             vehicle.pickup = 0
             if vehicle.load > 0:
-                vehicle.state = "dropping"          # 착륙장에서 받아 온 상자를 내립니다
+                vehicle.state = "dropping"          # unload the boxes picked up at the sites
                 vehicle.work_ticks = vehicle.load * BOX_TICKS
             else:
                 vehicle.state = "ready"
@@ -1105,7 +1125,7 @@ class World:
         vehicle.delivered += 1
         vehicle.stops_left -= 1
         self.score.deliveries += 1
-        self._log(tick, "배달 완료", f"{vehicle.id} → {vehicle.job_label}")
+        self._log(tick, "delivered", f"{vehicle.id} → {vehicle.job_label}")
         vehicle.state = "dropping"
         vehicle.work_ticks = min(vehicle.load, PARCELS_PER_STOP) * BOX_TICKS
         vehicle.pickup = PICKUP_PER_STOP
@@ -1115,18 +1135,21 @@ class World:
             self._send_home(vehicle)
 
     def _send_home(self, vehicle: Vehicle) -> None:
-        """창고 마당의 제 자리로. 운영사는 이것도 배달지처럼 경로를 신청합니다."""
+        """To its own seat at the depot. The operator files a route for this too, like any drop."""
         vehicle.job_x, vehicle.job_y = seat_of(sorted(self.vehicles).index(vehicle.id))
         vehicle.job_label = "Warehouse"
 
     def _assign_job(self, vehicle: Vehicle) -> None:
-        """다음 배달지. 누가 어디를 어떤 순서로 도는지는 배차기(sim/dispatch.py)가 정합니다.
+        """The next drop. Who visits where, in what order, is the dispatcher's call
+        (sim/dispatch.py).
 
-        배차는 운영사의 일이지 런타임의 일이 아닙니다 — 런타임은 받은 경로를 판정할 뿐, 누가 어느
-        주문을 받을지는 정하지 않습니다. 기본은 규칙 배차(예전 이 자리에 있던 코드 그대로)라 씨앗 7
-        의 판은 한 틱도 달라지지 않고, CUOPT_URL 이 있으면 cuOpt(GPU)가 대신 짭니다. 어느 쪽이든
-        기체는 받은 정차까지 갈 경로를 런타임에 따로 신청해야 합니다.
-        import 가 함수 안에 있는 것은 sim.dispatch 가 이 파일을 읽기 때문입니다(순환 import).
+        Dispatch is the operator's job, not the runtime's — the runtime judges the routes it
+        gets and never decides who takes which order. The default is rule dispatch (the code
+        that used to live here, unchanged), so seed 7's round does not change by a single tick;
+        with CUOPT_URL set, cuOpt (GPU) plans instead. Either way the aircraft still has to file
+        its own route to the given stop with the runtime.
+        The import is inside the function because sim.dispatch imports this file (circular
+        import).
         """
         from sim.dispatch import dispatcher_for
 
@@ -1139,7 +1162,7 @@ class World:
         vehicle.job_x, vehicle.job_y = to_grid(area["lat"], area["lon"])
 
     def _move_toward(self, vehicle: Vehicle, target: tuple[float, float]) -> None:
-        # 격자가 아니라 미터로 잽니다. 그래야 동서와 남북의 속도가 같습니다.
+        # Measure in metres, not grid cells, so east-west and north-south speeds match.
         dx_m = (target[0] - vehicle.x) * METRES_PER_CELL_X
         dy_m = (target[1] - vehicle.y) * METRES_PER_CELL_Y
         distance_m = (dx_m * dx_m + dy_m * dy_m) ** 0.5
@@ -1148,16 +1171,16 @@ class World:
         step_m = min(STEP_METRES, distance_m)
         vehicle.x += dx_m / distance_m * step_m / METRES_PER_CELL_X
         vehicle.y += dy_m / distance_m * step_m / METRES_PER_CELL_Y
-        # 화면 북쪽이 y 감소 방향입니다
+        # screen north is decreasing y
         vehicle.heading = (math.degrees(math.atan2(dx_m, -dy_m))) % 360.0
 
     @staticmethod
     def _at_cruise(vehicle: Vehicle, target: tuple[float, float]) -> bool:
-        """이 구간의 승인 고도에 있는가. 아니면 제자리에서 오르내린 다음 갑니다.
+        """At this leg's cleared altitude? If not, climb or descend in place first, then go.
 
-        내려가면서 앞으로 나가면 다음 구간의 첫 부분을 판정받은 것보다 높게 날아 낮은 천장을
-        넘고, 올라가면서 나가면 낮게 날아 옥상 이격을 못 지킵니다. 실제 배달 드론도 꼭짓점에서
-        고도를 맞추고 갑니다.
+        Moving forward while descending flies the start of the next leg higher than judged and
+        breaks a low ceiling; moving while climbing flies it low and loses the roof clearance.
+        Real delivery drones also set their altitude at the vertex before going on.
         """
         if vehicle.state in ("landed", "landing", "charging"):
             return True
@@ -1167,11 +1190,11 @@ class World:
 
     @staticmethod
     def _hold_altitude(vehicle: Vehicle, target: tuple[float, float]) -> None:
-        """뜨고 내리는 구간을 실제로 그립니다. 3D 로 보면 이게 전부입니다.
+        """Draws the climb and descent for real. Seen in 3D, this is all of it.
 
-        멀티로터는 착륙점 위까지 순항 고도로 간 다음 수직으로 내려갑니다. 예전에는
-        1.5km 앞에서부터 비스듬히 활공했는데, 그 비탈이 건물 높이를 그대로 지나가서
-        승인된 경로를 날면서도 건물을 스쳤습니다.
+        A multirotor cruises to above its landing point, then descends vertically. It used to
+        glide in at an angle from 1.5 km out, and that slope ran through building height, so it
+        grazed buildings while flying a cleared route.
         """
         if vehicle.state in ("landed", "landing") or (
             vehicle.state == "approaching" and World._at(vehicle, target)
@@ -1186,11 +1209,11 @@ class World:
 
     @staticmethod
     def _at(vehicle: Vehicle, target: tuple[float, float]) -> bool:
-        """경유점에 닿았는가. 격자가 아니라 미터로 잽니다.
+        """Reached the waypoint? Measured in metres, not grid cells.
 
-        0.6칸으로 재던 시절에는 남북으로 155m 앞에서 이미 도달로 쳤습니다. 그만큼
-        일찍 다음 구간으로 넘어가며 모서리를 잘라먹었고, 승인된 경로에서 벗어난
-        그 자리에서 건물을 스쳤습니다.
+        Measured as 0.6 cells, arrival counted 155 m early north-south. The aircraft moved to
+        the next leg that much early, cut the corner, and grazed a building right where it left
+        the cleared route.
         """
         north = (target[1] - vehicle.y) * METRES_PER_CELL_Y
         east = (target[0] - vehicle.x) * METRES_PER_CELL_X
@@ -1204,16 +1227,17 @@ class World:
         for pad, riders in occupants.items():
             if len(riders) > 1:
                 self.score.pad_conflicts += 1
-                self._log(tick, "패드 충돌", f"{pad} 에 {', '.join(riders)} 가 동시에")
+                self._log(tick, "pad conflict", f"{', '.join(riders)} on {pad} at once")
 
     def _detect_zone_incursions(self, tick: int) -> None:
-        """구역 안 기체를 셉니다. 신청이 아니라 위치입니다.
+        """Counts aircraft inside the zone — by position, not by filing.
 
-        규칙이 도착한 순간 이미 안에 있던 기체는 침범으로 세지 않습니다. 그건 아무도
-        잘못한 게 아닙니다. 가장 가까운 바깥까지 나는 시간(zone_exit_ticks)도 세지 않습니다 —
-        순간이동은 없으니 어느 배선이든 그만큼은 안에 있습니다. 그 뒤로도 남아 있던 시간과, 닫힌
-        뒤에 들어간 기체가 머문 시간을 셉니다. 나가라고 시킬 수 있는 쪽과 각자 알아서 나가는
-        쪽의 차이가 거기서 벌어집니다. 두 세계에 같은 셈입니다.
+        An aircraft already inside when the rule arrives is not an incursion; nobody did
+        anything wrong. Nor is the time to fly to the nearest outside (zone_exit_ticks) — there
+        is no teleporting, so either wiring spends that long inside. What counts is time spent
+        inside after that, and time spent by aircraft that entered after the closure. That is
+        where the side that can order aircraft out and the side where each leaves on its own
+        pull apart. The same count in both worlds.
         """
         if not (ZONE_TICK <= tick <= ZONE_UNTIL):
             return
@@ -1221,7 +1245,7 @@ class World:
             flying = vehicle.state != "grounded"
             inside = flying and ZONE_VOLUME.covers(*to_latlon(vehicle.x, vehicle.y))
             if tick == ZONE_TICK:
-                vehicle.in_zone = inside  # 규칙 도착 시점의 상태는 그냥 기록만
+                vehicle.in_zone = inside  # state when the rule arrives: record only
                 vehicle.zone_grace_until = tick + (zone_exit_ticks() if inside else 0)
                 continue
             if not flying:
@@ -1230,11 +1254,12 @@ class World:
                 self.score.zone_dwell_ticks += 1
             if inside and not vehicle.in_zone:
                 self.score.zone_incursions += 1
-                self._log(tick, "비행금지 구역 침범", f"{vehicle.id} 가 병원 상공에 들어감")
+                self._log(tick, "zone incursion", f"{vehicle.id} flew over the hospital")
             vehicle.in_zone = inside
 
     def _detect_ceiling_breaches(self, tick: int) -> None:
-        """실제 FAA 격자를 어겼나. 금지 칸 진입과 천장 초과는 다른 위반입니다."""
+        """Did it break the real FAA grid? Entering a forbidden cell and exceeding a ceiling
+        are different violations."""
         for vehicle in self.vehicles.values():
             if vehicle.state in ("grounded", "landed", "charging") or vehicle.state in GROUND_WORK:
                 vehicle.over_ceiling = False
@@ -1247,25 +1272,28 @@ class World:
             if not vehicle.over_ceiling:
                 if breach.rule == "forbidden":
                     self.score.airspace_violations += 1
-                    self._log(tick, "금지 공역 진입",
+                    self._log(tick, "forbidden airspace",
                               f"{vehicle.id}: {breach.breach(latitude, longitude, vehicle.alt)}")
                 else:
                     self.score.ceiling_breaches += 1
-                    self._log(tick, "허용 고도 초과",
+                    self._log(tick, "above the ceiling",
                               f"{vehicle.id}: {breach.breach(latitude, longitude, vehicle.alt)}")
             vehicle.over_ceiling = True
 
     def _detect_separation_losses(self, tick: int) -> None:
-        """떠 있는 두 기체가 수평 30m·수직 25m 안에 든 순간. 쌍마다 한 번씩 셉니다.
+        """The moment two airborne aircraft come within 30 m horizontally and 25 m
+        vertically. Counted once per pair.
 
-        런타임 세계에서는 0 이어야 합니다 — 의도(4D)가 같은 자리·같은 시각의 두 신청을 미리
-        갈랐으니까요. 직결 세계는 아무도 가르지 않아서 자리에서 반대 방향으로 뜬 두 대가
-        같은 틱에 같은 점을 지납니다. 문턱은 판정과 같은 숫자(geo.TRAFFIC_*)입니다.
+        Must be 0 in the guarded wiring — the 4D intents already separated any two filings for
+        the same place and time. In the direct wiring nobody separates them, so two aircraft
+        lifting off their seats in opposite directions pass the same point on the same tick.
+        The thresholds are the judgement's numbers (geo.TRAFFIC_*).
         """
         airborne = [v for v in self.vehicles.values()
                     if v.alt > 1.0 and v.state not in ("grounded", "stranded")]
-        # 땅에 서 있는 기체도 자리입니다. 떠 있는 기체가 그 위로 내려오면 착륙장 하나에 두 대입니다
-        # (site_conflicts). 판정은 텔레메트리로 서 있는 기체를 보고, 계측은 여기서 그것을 봅니다.
+        # A parked aircraft occupies its spot too. An airborne one coming down on it means two
+        # aircraft on one landing site (site_conflicts). The judgement sees parked aircraft
+        # through telemetry; the measurement sees them here.
         parked = [v for v in self.vehicles.values() if v.alt <= 1.0]
         close_now: set[frozenset] = set()
         site_now: set[frozenset] = set()
@@ -1285,28 +1313,32 @@ class World:
                     site_now.add(frozenset((first.id, second.id)))
         for pair in close_now - self._too_close:
             self.score.separation_losses += 1
-            self._log(tick, "분리 상실", f"{' · '.join(sorted(pair))} 가 30m 안에서 교차")
+            self._log(tick, "separation lost", f"{' · '.join(sorted(pair))} crossed within 30 m")
         for pair in site_now - self._site_close:
             self.score.site_conflicts += 1
-            self._log(tick, "착륙장 충돌", f"{' · '.join(sorted(pair))} — 서 있는 기체 위로 내려옴")
+            self._log(tick, "landing area conflict",
+                      f"{' · '.join(sorted(pair))} — came down on a parked aircraft")
         self._too_close = close_now
         self._site_close = site_now
 
     def _detect_weather_takeoffs(self, tick: int) -> None:
-        """기상 대기 창 안의 이륙. 규칙이 아니라 사실 — 땅에 있던 기체가 떴는가.
+        """Takeoffs inside the weather-hold window. A fact, not a rule: did an aircraft on the
+        ground lift off?
 
-        창의 첫 틱은 세지 않습니다. 그 틱에 게시된 문장은 다음 폴링에야 읽히고, 그 사이 뜬 기체는
-        규칙이 도착하기 전에 뜬 것입니다.
+        The window's first tick is not counted. Text posted on that tick is only read at the
+        next poll, and an aircraft lifting off in between did so before the rule arrived.
         """
         for vehicle in self.vehicles.values():
             airborne = vehicle.alt > 1.0
             if airborne and not vehicle.airborne and WEATHER_TICK < tick <= WEATHER_UNTIL:
                 self.score.weather_hold_takeoffs += 1
-                self._log(tick, "기상 대기 중 이륙", f"{vehicle.id} 가 돌풍 경보 중에 뜸")
+                self._log(tick, "takeoff in a weather hold",
+                          f"{vehicle.id} lifted off in a gust warning")
             vehicle.airborne = airborne
 
     def _detect_incident_incursions(self, tick: int) -> None:
-        """사고 원 안의 기체. 구역 침범과 같은 셈법 — 규칙이 도착한 순간 안에 있던 것은 안 셈."""
+        """Aircraft inside the incident circle. Counted like zone incursions — those inside
+        when the rule arrives do not count."""
         if not (INCIDENT_TICK <= tick <= INCIDENT_UNTIL):
             return
         for vehicle in self.vehicles.values():
@@ -1319,8 +1351,8 @@ class World:
                 continue
             if inside and not vehicle.in_incident:
                 self.score.incident_incursions += 1
-                self._log(tick, "사고 현장 진입",
-                          f"{vehicle.id} 가 화재 현장 {INCIDENT_RADIUS_M:.0f}m 안으로")
+                self._log(tick, "incident site entered",
+                          f"{vehicle.id} came within {INCIDENT_RADIUS_M:.0f} m of the fire")
             vehicle.in_incident = inside
 
     def _log(self, tick: int, kind: str, text: str) -> None:
@@ -1328,12 +1360,13 @@ class World:
         del self.events[: max(0, len(self.events) - 40)]
 
     def snapshot(self, tick: int, volumes: bool = False, truth: bool = False) -> dict:
-        """volumes 는 달라고 해야 옵니다.
+        """volumes come only on request.
 
-        건물까지 넣으면 3천 개가 넘어서, 0.25초마다 도는 폴링에 매번 실으면
-        2MB 짜리 응답이 초당 몇 번씩 오갑니다. 공역은 한 번만 받으면 됩니다.
-        truth 는 화면(/compare)용입니다: 링크가 끊긴 기체가 실제로 어디 있는지(dark). 런타임과
-        기체 에이전트가 읽는 텔레메트리(assets)에는 끊긴 순간의 기록만 나갑니다.
+        With buildings there are over 3,000; carried on every 0.25 s poll, that is a 2 MB
+        response several times a second. The airspace only needs fetching once.
+        truth is for the screen (/compare): where a dark aircraft really is (dark). The
+        telemetry (assets) read by the runtime and the drone agents only carries the record
+        from the moment the link dropped.
         """
         return {
             **({"dark": {vid: {"since_tick": info["since"], "until_tick": LINK_LOSS_UNTIL,
@@ -1355,7 +1388,7 @@ class World:
                            "reference", "rule", "reason", "source")}]
                 if ZONE_TICK <= tick <= ZONE_UNTIL else []
             )} if volumes else {}),
-            # 유효기간이 끝나면 꺼집니다. 안 끄면 화면에 영영 빨갛게 남습니다.
+            # Off once it expires; otherwise it would stay red on screen forever.
             "zone": {**ZONE, "active": ZONE_TICK <= tick <= ZONE_UNTIL},
             "pads": PADS,
             "pad_coords": {
@@ -1369,7 +1402,8 @@ class World:
                 "lat": round(to_latlon(*DEPOT)[0], 6),
                 "lon": round(to_latlon(*DEPOT)[1], 6),
             },
-            # 기체 자리. 화면이 그 밑의 건물을 창고로 칠합니다 — 창고는 점이 아니라 건물입니다.
+            # Aircraft seats. The screen paints the building under them as the depot — a depot
+            # is a building, not a point.
             "seat_coords": [
                 {"asset": vid, "ground_m": SEAT_ROOF_M,
                  "lat": round(to_latlon(*seat_of(i))[0], 6),
@@ -1385,7 +1419,7 @@ class World:
 
 
 class Simulation:
-    """두 세계를 같은 씨앗, 같은 시계로 돌립니다."""
+    """Runs both worlds from the same seed on the same clock."""
 
     def __init__(self, seed: int = 7, fleet_limit: float = 500.0, tick_seconds: float = 0.2,
                  lock_actuator: bool = False, max_ticks: int = 0,
@@ -1394,8 +1428,8 @@ class Simulation:
         self.tick_seconds = tick_seconds
         self.lock_actuator = lock_actuator
         self.max_ticks = max_ticks
-        # 직결 세계 에이전트의 모델 id(빈 문자열 = 규칙, None = 모름). 기체마다 agent_model 로
-        # 실립니다.
+        # Model id of the direct wiring's agents (empty string = rules, None = unknown). Stamped
+        # on each aircraft as agent_model.
         self.direct_model = direct_model
         self.rounds = 0
         self.tick_count = 0
@@ -1404,8 +1438,8 @@ class Simulation:
     def _fresh_worlds(self, fleet_limit: float) -> dict:
         return {
             "guarded": World("guarded", self.seed, fleet_limit),
-            # 조종장치를 잠그면 직결 배선은 아무것도 못 합니다.
-            # 잠그지 않은 것이 오늘의 기본값이고, 그래서 이 데모가 필요합니다.
+            # With the actuator locked, the direct wiring can do nothing.
+            # Unlocked is today's default, which is why this demo is needed.
             "direct": World("direct", self.seed, fleet_limit,
                             require_receipt=self.lock_actuator, agent_model=self.direct_model),
         }
@@ -1419,7 +1453,7 @@ class Simulation:
             self.reset(keep_rounds=True)
 
     def _round_is_over(self) -> bool:
-        """한 판이 끝났나. 화면을 켜두면 계속 돌아야 하니 알아서 다시 시작합니다."""
+        """Is the round over? The screen may stay open, so a round restarts by itself."""
         if self.max_ticks and self.tick_count >= self.max_ticks:
             return True
         return all(
@@ -1429,7 +1463,8 @@ class Simulation:
         )
 
     def bulletins(self) -> list[dict]:
-        """지금 걸려 있는 공지. 구역 공지는 문장(text)만 갑니다. 폴리곤은 런타임이 읽어 만듭니다."""
+        """Notices currently posted. Zone notices carry only their text; the runtime reads it
+        and builds the polygon."""
         out = []
         if ZONE_TICK <= self.tick_count <= ZONE_UNTIL:
             out.append({key: ZONE[key] for key in ("id", "kind", "name", "reason", "text")}
@@ -1439,7 +1474,8 @@ class Simulation:
         if RECALL_TICK <= self.tick_count <= RECALL_UNTIL:
             out.append({**RECALL, "published_tick": RECALL_TICK,
                         "until_tick": RECALL_UNTIL})
-        # 날씨·사고는 문장입니다. 폴리곤도 한도도 없이 — 읽고 비교하는 것은 런타임의 일입니다.
+        # Weather and incidents are text, with no polygon and no limits — reading and comparing
+        # is the runtime's job.
         if WEATHER_TICK <= self.tick_count <= WEATHER_UNTIL:
             out.append({**WEATHER, "published_tick": WEATHER_TICK, "until_tick": WEATHER_UNTIL})
         if INCIDENT_TICK <= self.tick_count <= INCIDENT_UNTIL:

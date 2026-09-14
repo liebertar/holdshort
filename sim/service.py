@@ -4,7 +4,7 @@ import os
 import threading
 import time
 
-from holdshort.core.http import JsonServer
+from shared.http import JsonServer
 from sim.world import Simulation
 
 
@@ -14,12 +14,13 @@ def main() -> None:
         fleet_limit=float(os.getenv("FLEET_LIMIT_USD", "500")),
         tick_seconds=float(os.getenv("TICK_SECONDS", "0.2")),
         lock_actuator=os.getenv("LOCK_ACTUATOR", "0") == "1",
-        # 화면을 켜두면 계속 돌아야 합니다. 한 판이 끝나면 알아서 다시 시작합니다.
-        # 서비스 반경 11km 라 편도가 570틱까지 갑니다. 배달지 두 곳을 돌고 창고까지 오려면
-        # 한 바퀴가 2천 틱 안팎이고, 한 판에 두 바퀴는 돌아야 순환이 보입니다.
-        max_ticks=int(os.getenv("ROUND_TICKS", "5000")),   # 할렘 왕복 4,040틱 + 여유
-        # 직결 세계 에이전트의 모델 id. 그 에이전트들은 런타임에 닿을 길이 없어(compose 의 world 망)
-        # 띄운 쪽(scripts/dev.sh·compose)이 알려 줍니다. 비어 있으면 규칙, 없으면 모르는 것.
+        # With the screen open it must keep running; a finished round restarts by itself.
+        # The 11 km service radius makes a one-way leg up to 570 ticks. Two drops and back to
+        # the depot is about 2,000 ticks a trip, and a round needs two trips for the cycle to show.
+        max_ticks=int(os.getenv("ROUND_TICKS", "5000")),   # Harlem round trip 4,040 ticks + margin
+        # Model id of the direct wiring's agents. They have no way to reach the runtime (compose's
+        # world network), so whoever starts them (scripts/dev.sh, compose) passes it in. Empty
+        # means rules; unset means unknown.
         direct_model=os.getenv("DIRECT_MODEL"),
     )
 
@@ -35,18 +36,19 @@ def main() -> None:
         world = simulation.worlds.get(name)
         if world is None:
             return 404, {"error": f"unknown world {name}"}
-        # 판 번호를 같이 보냅니다. 런타임이 한 판짜리 상태(예산·잠금)를 언제
-        # 비워야 하는지 알 방법이 이것뿐입니다.
-        # 공역은 달라고 할 때만 싣습니다. 건물까지 3천 개가 넘어서 매번 보낼 수 없습니다.
+        # Send the round number too: it is the only way the runtime knows when to clear its
+        # per-round state (budget, locks).
+        # Airspace volumes only on request — with buildings there are over 3,000, too many to
+        # send every time.
         wants_volumes = query.get("volumes") in ("1", "true", "yes")
         return 200, {**world.snapshot(simulation.tick_count, volumes=wants_volumes),
                      "round": simulation.rounds}
 
     def reset(body, query):
-        """판을 처음부터. 화면을 열었을 때 시나리오 시작점에서 보고 싶을 때 씁니다.
+        """Restart the round, for when you open the screen and want the scenario from the start.
 
-        조종장치로 가는 명령이 아니라 시연용 되감기입니다. 런타임은 판 번호가
-        바뀐 것을 보고 자기 상태(예산·잠금·공지)를 알아서 새로 시작합니다.
+        A demo rewind, not a command to the actuator. The runtime sees the round number change
+        and resets its own state (budget, locks, notices).
         """
         simulation.reset()
         return 200, {"ok": True, "round": simulation.rounds, "tick": simulation.tick_count}
@@ -67,23 +69,24 @@ def main() -> None:
         return 200, result
 
     def compare(body, query):
-        # 승인 화면의 리콜 줄은 리콜 공지에만. 첫 공지의 틱을 주면 날씨·사고 창에도 리콜이라고
-        # 뜹니다.
+        # The approval screen's recall line is for the recall notice only. Giving the first
+        # notice's tick would label the weather and incident windows as a recall too.
         recall = next((b for b in simulation.bulletins() if b.get("kind") == "recall"), None)
         return 200, {
             "tick": simulation.tick_count,
             "round": simulation.rounds,
             "recall_tick": recall["published_tick"] if recall else None,
-            # 지금 걸려 있는 공지 전부. 화면이 무슨 규칙이 도착했는지 그대로 씁니다.
-            # 구역 공지는 문장(text)뿐입니다. 화면 배너는 런타임 /state 의 notices 가 그리고,
-            # 여기 것은 "무엇이 도착했나" 의 원문입니다.
+            # Every notice currently posted; the screen shows which rules arrived, as is.
+            # Zone notices carry only their sentence (text). The screen banner is drawn from the
+            # runtime's /state notices; these are the originals of "what arrived".
             "bulletins": [{k: b.get(k) for k in ("id", "kind", "name", "reason", "text",
                                                   "published_tick", "until_tick",
                                                   "forbid_action", "applies_to",
                                                   "address", "radius_m", "building_id")}
                           for b in simulation.bulletins()],
-            # 화면용이라 사실(truth)도 같이: 링크가 끊긴 기체가 실제로 어디 있는지(dark). 런타임과
-            # 기체 에이전트가 읽는 /state 에는 끊긴 순간의 기록만 나갑니다.
+            # For the screen, so the truth comes too: where a lost-link aircraft really is
+            # (dark). The /state read by the runtime and the drone agents only carries the
+            # record from the moment the link dropped.
             "worlds": {
                 name: world.snapshot(simulation.tick_count, truth=True)
                 for name, world in simulation.worlds.items()
@@ -91,7 +94,7 @@ def main() -> None:
         }
 
     def rows(body, query):
-        """Grafana 가 그대로 먹을 수 있는 평평한 표. 중첩이 없어야 설정이 안 늘어납니다."""
+        """A flat table Grafana takes as is. No nesting, so its config does not grow."""
         out = []
         for name, world in simulation.worlds.items():
             snapshot = world.snapshot(simulation.tick_count)
@@ -103,7 +106,7 @@ def main() -> None:
                     )
             for vehicle in snapshot["assets"].values():
                 out.append({
-                    "world": "런타임" if name == "guarded" else "직접",
+                    "world": "runtime" if name == "guarded" else "direct",
                     "wiring": name,
                     "id": vehicle["id"],
                     "model": vehicle["model"],
@@ -119,20 +122,24 @@ def main() -> None:
         return 200, out
 
     def scoreboard_rows(body, query):
+        # The words the approval screen uses (frontend/approvals.html), counter for counter, so the
+        # endpoint and the screen cannot drift apart unseen. The last two have no twin there.
         labels = [
-            ("pad_conflicts", "착륙 패드 충돌"),
-            ("post_recall_violations", "리콜 이후 금지 행동"),
-            ("unapproved_passenger_actions", "승객 영향 무단 실행"),
-            ("unrecorded_actions", "기록 없는 실행"),
-            ("batteries_dead", "방전으로 멈춤"),
-            ("spend_usd", "기단 지출 ($)"),
-            ("over_fleet_limit_usd", "기단 한도 초과 ($)"),
-            ("human_approvals", "사람이 승인한 건"),
+            ("pad_conflicts", "Landing pad collisions"),
+            ("post_recall_violations", "Banned acts after a recall"),
+            ("weather_hold_takeoffs", "Takeoffs during a weather hold"),
+            ("incident_incursions", "Flights into an incident scene"),
+            ("unapproved_passenger_actions", "Unapproved passenger acts"),
+            ("unrecorded_actions", "Acts with no record"),
+            ("batteries_dead", "Stopped on a dead battery"),
+            ("human_approvals", "Approved by a person"),
+            ("spend_usd", "Fleet spend ($)"),
+            ("over_fleet_limit_usd", "Over the fleet limit ($)"),
         ]
         guarded = simulation.worlds["guarded"].score.public()
         direct = simulation.worlds["direct"].score.public()
         return 200, [
-            {"지표": label, "런타임": guarded[key], "직접": direct[key]}
+            {"metric": label, "runtime": guarded[key], "direct": direct[key]}
             for key, label in labels
         ]
 

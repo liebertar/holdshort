@@ -9,8 +9,8 @@ is used.
 
 | Tier | Nebius Token Factory | Local (Ollama) | Sits | Reads | Writes |
 |---|---|---|---|---|---|
-| Nano | `nvidia/Nemotron-3_5-Lightning` (30B-A3B) | `nemotron-3-nano:4b`, one server per aircraft (11435–11438, `scripts/ollama_fleet.sh`) | in each aircraft's agent | telemetry, the concern, refusal feedback; for a route choice, the candidates with the weather, the notices in force and other aircraft's windows | the request form (action + one-line rationale); a `choose_route(id, reason)` call; a waypoint draft only after every candidate is refused |
-| Super | `nvidia/nemotron-3-super-120b-a12b` (120B-A12B, 1M context) | `nemotron-3-nano:4b` as a stand-in on the tower server (11439, 8k context) | beside the runtime | prose notices, incident reports, search snippets, briefing pages the grammar cannot read, the ledger context behind an advisory | a structured form (kind, place, window, numbers), the two-sentence briefing summary, a two-sentence advisory summary and one option id |
+| Nano | `nvidia/Nemotron-3_5-Lightning` (30B-A3B) | `nemotron-3-nano:4b`, one server per aircraft (11435–11438, `scripts/ollama_fleet.sh`) | in each aircraft's agent (a high-urgency form goes to Super) | telemetry, the concern, refusal feedback; for a route choice, the candidates with the weather, the notices in force and other aircraft's windows | the request form (action + one-line rationale); a `choose_route(id, reason)` call; a waypoint draft only after every candidate is refused |
+| Super | `nvidia/nemotron-3-super-120b-a12b` (120B-A12B, 1M context) | `nemotron-3-nano:4b` as a stand-in on the runtime server (11439, 8k context) | beside the runtime | prose notices, incident reports, search snippets, briefing pages the grammar cannot read, the ledger context behind an advisory | a structured form (kind, place, window, numbers), the two-sentence briefing summary, a two-sentence advisory summary and one option id |
 | Ultra | `nvidia/Nemotron-3-Ultra-550b-a55b` | not run locally | beside the runtime | the set of proposals that all passed | one choice from that set and a reason |
 
 Why these: the Nemotron 3 cards describe agentic workflows, tool calling, long-context reasoning and
@@ -20,7 +20,7 @@ last resort. The judge is code.
 
 ## Route choice
 
-After the straight line is refused, the operator's planner (`holdshort/core/route.py`) draws up to three
+After the straight line is refused, the operator's planner (`shared/route.py`) draws up to three
 legal candidates on the agent's own copy of the airspace:
 
 | id | Candidate |
@@ -35,7 +35,7 @@ enum of the candidate ids. The tool executes nothing. The agent files the chosen
 them like any other filing. If the pick is refused, the agent files the remaining candidates; the model's
 waypoint draft comes only after every candidate is refused.
 
-When the model cannot choose, the code does (`holdshort/agent/chooser.py`):
+When the model cannot choose, the code does (`drone/agent/chooser.py`):
 
 - A server that rejects `tools` (HTTP 400, also after a retry with `tool_choice: auto`) is not sent tools
   again; the same question goes out as a JSON form.
@@ -85,8 +85,8 @@ forms the model had written into `rules`.
 the same table):
 
 ```
-NEBIUS_API_KEY set        → Nebius: Nano per aircraft, Super and Ultra at the tower
-else Ollama fleet answers → local 4B per aircraft (11435–11438); tower stand-in on 11439, else 11434
+NEBIUS_API_KEY set        → Nebius: Nano per aircraft, Super and Ultra at the runtime
+else Ollama fleet answers → local 4B per aircraft (11435–11438); runtime stand-in on 11439, else 11434
 else Ollama answers       → one local model for everyone (11434)
 else                      → rules only (forms and route choice by rules, routes by A*, prose left for a person)
 
@@ -100,7 +100,7 @@ else                      → simulated weather report
 Compose does not probe for servers. `NEBIUS_API_KEY` alone reaches Token Factory. For the Mac's Ollama fleet
 from containers, set the `host.docker.internal` URLs and `MODEL_NANO`/`MODEL_SUPER`, because the compose
 defaults are Nebius ids, and set `MODEL_ULTRA=` empty, because there is no local Ultra. The compose block in
-`.env.example` has the lines to uncomment.
+`.env.local.example` has the lines to uncomment.
 
 Nothing else changes between these modes. The judge, the ledger and the scoreboard are identical.
 
@@ -116,14 +116,14 @@ scripts/ollama_fleet.sh start 4
 NEBIUS_API_KEY=... ./scripts/dev.sh
 
 # Nebius under compose
-cp .env.example .env.local        # set NEBIUS_API_KEY
-docker compose --env-file .env.local up --build
+cp .env.local.example .env.local        # set NEBIUS_API_KEY
+docker compose -f docker-compose.local.yml --env-file .env.local up --build
 ```
 
-`scripts/ollama_fleet.sh start 4` starts four drone servers (11435–11438) and a tower server (11439), all with
+`scripts/ollama_fleet.sh start 4` starts four drone servers (11435–11438) and a runtime server (11439), all with
 an 8k context, and warms the 4B on each. The resolver gives the runtime 11439 before 11434 because the Ollama
 app loads a 262,144-token context, which adds over 5 GB of KV cache for the same 4B. `OLLAMA_FLEET_TOWER=0`
-skips the tower server.
+skips the runtime server.
 
 Real memory, measured with `footprint`: about 7.5 GB per 8k server, because each server holds its own copy of
 the weights. Ollama reports 3.0 GB; that is the model, not what the server holds. The four drone servers take

@@ -15,24 +15,24 @@ import threading
 import time
 import unittest
 
-from holdshort.core.config import WeatherLimits
-from holdshort.core.intake import (
+from backend.intake.book import IntakeBook, WeatherHold
+from backend.runtime.tower import Runtime
+from shared.config import WeatherLimits
+from shared.intake import (
     Gazetteer,
     normalise_address,
     parse_incident,
     parse_weather,
 )
-from holdshort.core.models import Proposal, Verdict
-from holdshort.core.notam import Clock
-from holdshort.core.tavily import IntakePoller, TavilyClient, reduce_results
-from holdshort.runtime.intake import IntakeBook, WeatherHold
-from holdshort.runtime.service import Runtime
+from shared.models import Proposal, Verdict
+from shared.notam import Clock
+from shared.tavily import IntakePoller, TavilyClient, reduce_results
 from sim import world as sim_world
 from tests.fixture_llm import FixtureLlm, load_fixtures
 
 CONFIG = "configs/fleet.yaml"
 CLOCK = Clock("0900", 0.8)
-GANTRY = (40.74584, -73.95862)                 # 갠트리플라자 착륙장
+GANTRY = (40.74584, -73.95862)                 # Gantry Plaza landing site
 HERE = (40.7100, -73.9855)
 
 
@@ -70,8 +70,8 @@ def make_runtime(llm=None, **env):
     runtime.landing_areas = sim_world.LANDING_AREAS
     runtime.tick = 2200
     runtime.telemetry = {
-        # 땅에 서서 승인 경로를 기다리는 기체(route 없음), 땅에서 승인만 받고 아직 안 뜬 기체,
-        # 떠 있는 기체.
+        # One on the ground waiting for a cleared route (no route), one on the ground with a
+        # clearance that has not taken off yet, and one airborne.
         "drone-01": {"lat": HERE[0], "lon": HERE[1], "alt_m": 0.0},
         "drone-02": {"lat": 40.7150, "lon": -73.9700, "alt_m": 0.0,
                      "route": [{"lat": 40.7300, "lon": -73.9700, "alt_m": 60.0}]},
@@ -110,7 +110,7 @@ def pending(runtime, action):
     return [p for p in runtime.snapshot()["awaiting_human"] if p["action"] == action]
 
 
-# ---------- 문법 ----------
+# ---------- Grammar ----------
 
 class WeatherGrammarTest(unittest.TestCase):
     def test_spelled_out_metar_in_knots_and_statute_miles(self):
@@ -141,11 +141,12 @@ class WeatherGrammarTest(unittest.TestCase):
         self.assertEqual((ticks.from_tick, ticks.until_tick), (100, 200))
         zulu = parse_weather("WIND 240 AT 30 KT 0930-0940Z", CLOCK)
         self.assertEqual((zulu.from_tick, zulu.until_tick), (2250, 3000))
-        self.assertIsNone(zulu.visibility_m, "창의 첫 시각은 시정이 아닙니다")
+        self.assertIsNone(zulu.visibility_m, "the window's start time is not a visibility")
 
     def test_a_zulu_window_after_the_wind_group_is_not_a_metar_visibility(self):
-        """"KT 0930-0940Z" 의 0930 을 시정 930 m 로 읽으면 한도 안의 바람에 없는 시정 위반이 붙어
-        이륙이 섭니다. 4자리 시정은 홀로 서야 합니다."""
+        """Reading the 0930 in "KT 0930-0940Z" as a 930 m visibility adds a visibility breach
+        that doesn't exist to a wind within limits, and takeoffs stop. A 4-digit visibility must
+        stand alone."""
         for text in ("WIND 240 AT 12 KT 1200-1300Z", "WIND 240 AT 30 KT 0700-0800Z",
                      "KNYC 092951Z 24018G28KT 0935-0945Z"):
             self.assertIsNone(parse_weather(text, CLOCK).visibility_m, text)
@@ -200,7 +201,7 @@ class IncidentGrammarTest(unittest.TestCase):
                      "Big sale at 10 West 46th Street", "", "Police"):
             self.assertIsNone(parse_incident(text, self.gazetteer, CLOCK), text)
         self.assertIsNone(parse_incident("Fire at bldg-t99999", self.gazetteer, CLOCK),
-                          "모르는 건물 id 는 자리가 아닙니다")
+                          "an unknown building id is not a place")
 
 
 class ThresholdTest(unittest.TestCase):
@@ -240,7 +241,7 @@ class ThresholdTest(unittest.TestCase):
         self.assertFalse(policies[0].matches("fly_route", None, ground, 2701))
 
 
-# ---------- 기상 대기 ----------
+# ---------- Weather hold ----------
 
 class WeatherHoldTest(unittest.TestCase):
     def setUp(self):
@@ -263,7 +264,8 @@ class WeatherHoldTest(unittest.TestCase):
                           "weather-hold:depart"])
         self.assertTrue(all(p["ground_only"] for p in snap["policies"]))
         self.assertEqual(snap["weather"]["last_report"]["id"], sim_world.WEATHER["id"])
-        # 땅에서 승인만 받고 아직 안 뜬 기체는 물립니다. 떠 있는 기체는 그대로.
+        # The aircraft cleared on the ground but not yet off is pulled back. The airborne one is
+        # left alone.
         self.assertEqual([s[:2] for s in self.adapter.sent], [("drone-02", "divert_ground")])
         self.assertEqual(self.runtime.snapshot()["intake"]["items_read"], 1)
         self.assertEqual(codes(self.runtime),
@@ -271,19 +273,19 @@ class WeatherHoldTest(unittest.TestCase):
         recalled = ledger_lines(self.runtime)[-1]
         self.assertEqual((recalled["proposal"]["asset_id"], recalled["decision"]["policy_hit"]),
                          ("drone-02", "weather-hold"))
-        # 한 번 읽은 항목은 다시 읽지도 적지도 않습니다.
+        # An item read once is neither read nor ledgered again.
         self.runtime.absorb([weather_item()])
         self.assertEqual(len(codes(self.runtime)), 4)
 
     def test_a_route_cleared_in_the_same_tick_the_hold_opens_is_pulled_back_too(self):
-        """텔레메트리는 지난 폴링 것이라 방금 승인한 경로가 아직 없습니다.
+        """Telemetry is from the last poll, so the route just approved is not in it yet.
 
-        기준은 런타임의 의도입니다. 라이브에서 drone-02 가 보류가 열린 틱 2175 에 승인받고, 25틱 뒤
-        보류 중에 떴습니다.
+        The runtime's intent is what counts. Live, drone-02 was approved at tick 2175, when the
+        hold opened, and took off 25 ticks later during the hold.
         """
         decision = self.runtime.file(route("drone-01", [HERE, (40.7200, -73.9855)]))
         self.assertEqual(decision.verdict, Verdict.AUTO, decision.reason)
-        self.assertFalse(self.runtime.telemetry["drone-01"].get("route"), "텔레메트리는 아직 옛것")
+        self.assertFalse(self.runtime.telemetry["drone-01"].get("route"), "telemetry is still old")
         self.open_hold()
         grounded = [sent[0] for sent in self.adapter.sent if sent[1] == "divert_ground"]
         self.assertEqual(sorted(grounded), ["drone-01", "drone-02"])
@@ -303,7 +305,7 @@ class WeatherHoldTest(unittest.TestCase):
         self.assertEqual((depart.verdict, depart.code, depart.policy_hit),
                          (Verdict.DENIED, "policy", "weather-hold:depart"))
         self.assertIn("WEATHER HOLD", depart.reason)
-        self.assertEqual([s[1] for s in self.adapter.sent], ["divert_ground"], "실행된 것 없음")
+        self.assertEqual([s[1] for s in self.adapter.sent], ["divert_ground"], "nothing executed")
         refused = [e for e in ledger_lines(self.runtime) if e["decision"]["code"] == "policy"]
         self.assertEqual(refused[0]["context"]["policies"][:3],
                          ["weather-hold:fly_route", "weather-hold:reserve_pad",
@@ -333,19 +335,19 @@ class WeatherHoldTest(unittest.TestCase):
         self.assertEqual(len(cards), 1)
         self.assertEqual(cards[0]["asset_id"], "fleet")
         self.assertEqual(self.runtime._decisions[cards[0]["id"]].code, "human_lift")
-        # 거부: 카드는 내려가고 대기는 그대로.
-        denied = self.runtime.approve(cards[0]["id"], "관제사", allow=False)
+        # Refused: the card comes down and the hold stays.
+        denied = self.runtime.approve(cards[0]["id"], "controller", allow=False)
         self.assertEqual((denied.verdict, denied.code), (Verdict.DENIED, "lift_refused"))
         self.assertIsNotNone(self.runtime.snapshot()["weather"]["hold"])
         self.assertEqual(pending(self.runtime, "lift_weather_hold"), [])
         self.assertEqual(len(self.runtime.snapshot()["policies"]), 3)
-        # 한도 안의 보고서가 오면 카드가 다시 오르고, 승인하면 그 자리에서 풀립니다.
+        # A report within limits puts the card back up, and approving it lifts the hold on the spot.
         self.runtime.absorb([{"id": "wx-calm", "kind": "weather",
                               "text": "KNYC 0933Z WIND 240 AT 8 KT VIS 10SM"}])
         card = pending(self.runtime, "lift_weather_hold")[0]
-        lifted = self.runtime.approve(card["id"], "관제사", allow=True)
+        lifted = self.runtime.approve(card["id"], "controller", allow=True)
         self.assertEqual((lifted.verdict, lifted.code, lifted.approved_by),
-                         (Verdict.AUTO, "weather_hold_lifted", "관제사"))
+                         (Verdict.AUTO, "weather_hold_lifted", "controller"))
         snap = self.runtime.snapshot()
         self.assertIsNone(snap["weather"]["hold"])
         self.assertEqual(snap["policies"], [])
@@ -359,7 +361,8 @@ class WeatherHoldTest(unittest.TestCase):
         self.open_hold()
         self.runtime.tick = sim_world.WEATHER_UNTIL
         self.runtime.absorb([weather_item()])
-        self.assertIsNotNone(self.runtime.snapshot()["weather"]["hold"], "창 안에서는 그대로")
+        self.assertIsNotNone(self.runtime.snapshot()["weather"]["hold"],
+                             "still in place inside the window")
         self.runtime.tick = sim_world.WEATHER_UNTIL + 1
         self.runtime.absorb([])
         snap = self.runtime.snapshot()
@@ -375,14 +378,15 @@ class WeatherHoldTest(unittest.TestCase):
         self.assertEqual(decision.verdict, Verdict.AUTO)
 
     def test_an_approval_that_waited_through_the_hold_is_rejudged_against_it(self):
-        """사람 카드에 서 있던 경로는 실행 직전에 다시 판정받습니다 — 그새 온 대기에 걸립니다."""
+        """A route that sat on a person's card is judged again right before it runs — and hits
+        the hold that arrived in the meantime."""
         public = Proposal(asset_id="drone-01", action="fly_route", cost_usd=12.0,
                           blast_radius="public", rationale="",
                           params={"legs": [{"lat": HERE[0], "lon": HERE[1], "alt_m": 60},
                                            {"lat": 40.7200, "lon": -73.9855, "alt_m": 60}]})
         self.assertIs(self.runtime.file(public.to_dict()).verdict, Verdict.HUMAN)
         self.open_hold()
-        decision = self.runtime.approve(public.id, "관제사", allow=True)
+        decision = self.runtime.approve(public.id, "controller", allow=True)
         self.assertEqual((decision.verdict, decision.code), (Verdict.DENIED, "policy"))
         self.assertIn("WEATHER HOLD", decision.reason)
         self.assertNotIn(("drone-01", "fly_route"), [s[:2] for s in self.adapter.sent])
@@ -410,14 +414,14 @@ class WeatherHoldTest(unittest.TestCase):
         self.assertIn("weather hold · tick 2200", self.runtime.report(fmt="md"))
 
 
-# ---------- 사고 ----------
+# ---------- Incidents ----------
 
 class IncidentTest(unittest.TestCase):
     def setUp(self):
         self.runtime, self.adapter = make_runtime()
         self.runtime.tick = sim_world.INCIDENT_TICK
         centre = sim_world.INCIDENT_CENTRE
-        # 갠트리로 들어가는 승인 경로를 날고 있는 기체 하나. 회수 대상입니다.
+        # One aircraft flying a cleared route into Gantry. It is the one to recall.
         self.runtime.telemetry = {
             "drone-02": {"lat": centre[0] - 0.02, "lon": centre[1], "alt_m": 60.0,
                          "route": [{"lat": GANTRY[0], "lon": GANTRY[1], "alt_m": 60.0}]},
@@ -440,10 +444,10 @@ class IncidentTest(unittest.TestCase):
         self.assertEqual((volume.floor_m, volume.ceiling_m, volume.rule),
                          (0.0, None, "forbidden"))
         self.assertIsNotNone(self.runtime.airspace.breach(*sim_world.INCIDENT_CENTRE, 120.0),
-                             "모든 고도에서 막힙니다")
-        # 날던 회랑은 회수됩니다.
+                             "blocked at every altitude")
+        # The corridor in flight is recalled.
         self.assertEqual([s[:2] for s in self.adapter.sent], [("drone-02", "divert_ground")])
-        # 새 경로는 거절되고, 거절은 사고 이름을 값으로 답합니다.
+        # A new route is refused, and the refusal answers with the incident's name as a value.
         through = route("drone-01", [(40.7100, -73.9700), sim_world.INCIDENT_CENTRE,
                                      (40.7600, -73.9500)])
         decision = self.runtime.file(through)
@@ -451,9 +455,10 @@ class IncidentTest(unittest.TestCase):
                          (Verdict.DENIED, "airspace", sim_world.INCIDENT["id"]))
         refused = ledger_lines(self.runtime)[-1]["proposal"]["params"]
         self.assertEqual(refused["blocked_name"], "FIRE · 4705 Center Boulevard")
-        # 원 안(둘레 50 m 까지)의 착륙장은 쓸 수 없습니다 — 갠트리플라자는 중심에서 156 m, 원의
-        # 가장자리 6 m 밖이라 마지막 구간이 이격(40 m)에 먼저 걸립니다. 착륙 검사만 보려면 가장자리
-        # 45 m 밖(이격은 지나고 착륙 둘레 50 m 에는 못 미치는 자리)에 북쪽에서 내려옵니다.
+        # A landing site inside the circle (or within 50 m of it) can't be used — Gantry Plaza is
+        # 156 m from the centre, 6 m outside the edge, so the last leg hits the margin (40 m)
+        # first. To see the landing check alone, come down from the north 45 m outside the edge
+        # (past the margin but still within the 50 m landing ring).
         self.runtime.tick += 20
         landing = self.runtime.file(route("drone-01", [(40.7100, -73.9700), GANTRY]))
         self.assertEqual((landing.verdict, landing.code, landing.forbids),
@@ -467,7 +472,7 @@ class IncidentTest(unittest.TestCase):
         landed = ledger_lines(self.runtime)[-1]["proposal"]["params"]
         self.assertEqual((landed["blocked_kind"], landed["blocked_name"]),
                          ("landing", "FIRE · 4705 Center Boulevard"))
-        self.assertIn("내려앉을 수 없습니다", landing.reason)
+        self.assertIn("cannot touch down", landing.reason)
         keepout = [e for e in ledger_lines(self.runtime)
                    if e["decision"]["code"] == "incident_keepout"]
         self.assertEqual(len(keepout), 1)
@@ -482,15 +487,16 @@ class IncidentTest(unittest.TestCase):
         self.assertEqual(snap["incidents"], [])
         self.assertIsNone(self.runtime.airspace.get(sim_world.INCIDENT["id"]))
         self.assertNotIn(sim_world.INCIDENT["id"],
-                         self.runtime._context(None)["policies"], "정책도 창과 함께 끝납니다")
+                         self.runtime._context(None)["policies"],
+                         "the policy ends with the window too")
         decision = self.runtime.file(route("drone-01", [(40.7100, -73.9700), GANTRY]))
         self.assertEqual(decision.verdict, Verdict.AUTO)
 
     def test_a_manual_line_with_a_building_id_becomes_a_keep_out_around_that_building(self):
-        from holdshort.core.geo import Volume
+        from shared.geo import Volume
 
         self.runtime.airspace.add(Volume.from_dict({
-            "id": "bldg-t777", "name": "건물 60m", "ceiling_m": 60.0,
+            "id": "bldg-t777", "name": "BUILDING 60 m", "ceiling_m": 60.0,
             "polygon": [[40.7500, -73.9900], [40.7500, -73.9890], [40.7508, -73.9890],
                         [40.7508, -73.9900]]}))
         status, body = self.runtime.submit_intake(
@@ -498,7 +504,8 @@ class IncidentTest(unittest.TestCase):
              "kind": "incident"})
         self.assertEqual((status, body["queued"]), (200, True))
         self.assertTrue(body["id"].startswith("manual-"))
-        self.assertEqual(self.runtime.snapshot()["incidents"], [], "읽기는 세계 스레드가 합니다")
+        self.assertEqual(self.runtime.snapshot()["incidents"], [],
+                         "the world thread does the reading")
         self.runtime.absorb([])
         incident = self.runtime.snapshot()["incidents"][0]
         self.assertEqual((incident["id"], incident["name"], incident["radius_m"],
@@ -506,18 +513,19 @@ class IncidentTest(unittest.TestCase):
                          (body["id"], "GAS LEAK · bldg-t777", 100.0,
                           sim_world.INCIDENT_TICK + 500, True, False))
         self.assertAlmostEqual(incident["centre"][0], 40.7504, places=4)
-        # 문법이 읽었어도 수동 입력은 관제탑 공지가 아닙니다 — 사람이 확인해야 걸립니다.
+        # Even read by the grammar, a manual entry is not a notice from the runtime's own feed —
+        # it applies only once a person confirms.
         self.assertIsNone(self.runtime.airspace.get(body["id"]))
         card = pending(self.runtime, "publish_notice")[0]
         self.assertEqual(card["author"], "grammar")
         self.assertIn("manual", self.runtime._decisions[card["id"]].reason)
-        self.runtime.approve(card["id"], "관제사", allow=True)
+        self.runtime.approve(card["id"], "controller", allow=True)
         self.assertIsNotNone(self.runtime.airspace.get(body["id"]))
-        self.assertEqual(self.runtime.snapshot()["incidents"][0]["confirmed_by"], "관제사")
+        self.assertEqual(self.runtime.snapshot()["incidents"][0]["confirmed_by"], "controller")
         self.assertEqual(self.runtime.submit_intake({"text": "   "})[0], 400)
 
 
-# ---------- 모델이 읽는 쪽 ----------
+# ---------- What a model reads ----------
 
 def fixture_super(*labels) -> FixtureLlm:
     records = [r for r in load_fixtures() if r.get("label") in labels]
@@ -527,7 +535,8 @@ def fixture_super(*labels) -> FixtureLlm:
 
 GUSTY = "Gusty afternoon across Manhattan, peaking near thirty this evening"
 CALM = "Calm and clear over the harbor tonight"
-# 문법은 "AT <번지> <거리>" 를 읽습니다. 이 문장은 주소가 그 꼴이 아니라 모델의 몫입니다.
+# The grammar reads "AT <number> <street>". This sentence's address is not in that form, so it
+# falls to the model.
 MIDTOWN = ("Three-alarm blaze tearing through a Midtown office tower; 10 W. 46th St. was "
            "evacuated, FDNY says")
 INVENTED = "Fire crews responding to a building near the river"
@@ -546,7 +555,7 @@ class ModelPathTest(unittest.TestCase):
                               "source": "tavily", "url": "https://example.test/wx"}])
         self.assertEqual([tier for tier, _ in self.llm.asked], ["super"])
         snap = self.runtime.snapshot()
-        self.assertIsNone(snap["weather"]["hold"], "사람이 확인하기 전에는 아무것도 안 섭니다")
+        self.assertIsNone(snap["weather"]["hold"], "nothing takes effect until a person confirms")
         self.assertEqual(snap["policies"], [])
         self.assertEqual([(h["id"], h["breaches"], h["source"]) for h in snap["weather"]["held"]],
                          [("news-1", ["gusts 16 m/s > 12"], "model:nemotron-3-super-reference")])
@@ -555,7 +564,7 @@ class ModelPathTest(unittest.TestCase):
         self.assertEqual(self.runtime._decisions[card["id"]].code, "human_weather")
         self.assertIs(self.runtime.file(route("drone-01", [HERE, (40.7200, -73.9855)])).verdict,
                       Verdict.AUTO)
-        decision = self.runtime.approve(card["id"], "관제사", allow=True)
+        decision = self.runtime.approve(card["id"], "controller", allow=True)
         self.assertEqual((decision.verdict, decision.code), (Verdict.AUTO, "weather_confirmed"))
         snap = self.runtime.snapshot()
         self.assertEqual((snap["weather"]["hold"]["source"], snap["weather"]["hold"]["reason"]),
@@ -577,7 +586,7 @@ class ModelPathTest(unittest.TestCase):
     def test_a_person_can_refuse_it_and_it_lapses_unseen(self):
         self.runtime.absorb([{"id": "news-1", "kind": "weather", "text": GUSTY}])
         card = pending(self.runtime, "publish_weather")[0]
-        decision = self.runtime.approve(card["id"], "관제사", allow=False)
+        decision = self.runtime.approve(card["id"], "controller", allow=False)
         self.assertEqual((decision.verdict, decision.code), (Verdict.DENIED, "weather_refused"))
         self.assertIsNone(self.runtime.snapshot()["weather"]["hold"])
         self.assertEqual(self.runtime.snapshot()["weather"]["held"], [])
@@ -605,11 +614,11 @@ class ModelPathTest(unittest.TestCase):
         self.assertIsNone(self.runtime.airspace.get("news-4"))
         card = pending(self.runtime, "publish_notice")[0]
         self.assertEqual(card["params"]["notice"]["kind"], "incident")
-        decision = self.runtime.approve(card["id"], "관제사", allow=True)
+        decision = self.runtime.approve(card["id"], "controller", allow=True)
         self.assertEqual((decision.verdict, decision.code), (Verdict.AUTO, "notice_published"))
         incident = self.runtime.snapshot()["incidents"][0]
         self.assertEqual((incident["applied"], incident["held"], incident["source"],
-                          incident["confirmed_by"]), (True, False, "human", "관제사"))
+                          incident["confirmed_by"]), (True, False, "human", "controller"))
         self.assertIsNotNone(self.runtime.airspace.get("news-4"))
         self.assertEqual([e["decision"]["code"] for e in ledger_lines(self.runtime)][-2:],
                          ["notice_published", "incident_keepout"])
@@ -623,7 +632,8 @@ class ModelPathTest(unittest.TestCase):
                   if e["decision"]["code"] == "intake_unreadable"]
         self.assertEqual(len(unread), 1)
         self.assertIn("999 Nowhere Lane", unread[0]["decision"]["detail"]["why"])
-        self.assertEqual(self.llm.stats["super"].fallback, 1, "버린 답은 규칙 폴백으로 셉니다")
+        self.assertEqual(self.llm.stats["super"].fallback, 1,
+                         "a discarded answer counts as a rules fallback")
         self.assertIn("999 Nowhere Lane", snap["intake"]["items"][0]["why"])
 
     def test_kind_none_is_read_and_changes_nothing(self):
@@ -641,7 +651,7 @@ class ModelPathTest(unittest.TestCase):
         runtime.absorb([{"id": "news-7", "text": GUSTY}])
         runtime.absorb([{"id": "news-7", "text": GUSTY}])
         self.assertEqual(codes(runtime), ["intake_received", "intake_unreadable"])
-        self.assertIn("모델이 없음", ledger_lines(runtime)[-1]["decision"]["reason"])
+        self.assertIn("no model to structure it", ledger_lines(runtime)[-1]["decision"]["reason"])
         self.assertEqual(runtime.snapshot()["intake"]["sources"],
                          {"tavily": "off", "sim": True, "metar": "off"})
 
@@ -653,7 +663,7 @@ class ModelPathTest(unittest.TestCase):
             if thread.name.startswith("intake-"):
                 self.assertTrue(thread.daemon)
                 thread.join(5.0)
-        self.assertEqual(self.runtime.snapshot()["weather"]["held"], [], "아직 적히기 전")
+        self.assertEqual(self.runtime.snapshot()["weather"]["held"], [], "not recorded yet")
         self.runtime.absorb([])
         self.assertEqual(self.runtime._reading_intake, set())
         self.assertEqual([h["id"] for h in self.runtime.snapshot()["weather"]["held"]], ["news-8"])
@@ -668,14 +678,15 @@ class ModelPathTest(unittest.TestCase):
                 thread.join(5.0)
         self.runtime._follow_round(2)
         self.runtime.absorb([])
-        self.assertEqual(self.runtime.snapshot()["weather"]["held"], [], "지난 판의 답은 버립니다")
+        self.assertEqual(self.runtime.snapshot()["weather"]["held"], [],
+                         "an answer from the last round is dropped")
         self.assertEqual(self.runtime.snapshot()["awaiting_human"], [])
 
 
 # ---------- Tavily ----------
 
 class FakeTavily(http.server.BaseHTTPRequestHandler):
-    """검색 서버 흉내. 클래스 속성으로 답과 지연을 바꿉니다."""
+    """Mimics the search server. Class attributes set the answer and the delay."""
 
     results: list[dict] = []
     delay_s = 0.0
@@ -743,11 +754,12 @@ class TavilyTest(unittest.TestCase):
         runtime.absorb([])
         snap = runtime.snapshot()
         self.assertEqual(snap["intake"]["items_read"], 1)
-        self.assertEqual(snap["intake"]["items_unreadable"], 1, "야구 기사는 모델 없이 못 읽음")
+        self.assertEqual(snap["intake"]["items_unreadable"], 1,
+                         "the baseball story can't be read without a model")
         self.assertEqual(snap["intake"]["sources"]["tavily"], "enabled")
         self.assertEqual(snap["intake"]["fetch"]["ok"], True)
-        # 검색 결과는 문법이 읽어도 관제탑 공지가 아닙니다 — 사람이 확인하기 전에는 아무것도 안
-        # 섭니다.
+        # A search result is not a notice from the runtime's own feed even if the grammar reads
+        # it — nothing takes effect before a person confirms.
         self.assertIsNone(snap["weather"]["hold"])
         self.assertEqual(snap["policies"], [])
         self.assertEqual([(h["breaches"], h["source"]) for h in snap["weather"]["held"]],
@@ -760,9 +772,9 @@ class TavilyTest(unittest.TestCase):
         self.assertEqual(first.count("intake_read"), 1)
         poller.fetch_once()
         runtime.absorb([])
-        self.assertEqual(codes(runtime), first, "같은 쪽은 다시 적지 않습니다")
+        self.assertEqual(codes(runtime), first, "the same page is not ledgered again")
         self.assertEqual(poller.fetches, 2)
-        runtime.approve(card["id"], "관제사", allow=True)
+        runtime.approve(card["id"], "controller", allow=True)
         hold = runtime.snapshot()["weather"]["hold"]
         self.assertEqual((hold["source"], hold["until_tick"]), ("human", 2200 + 500))
 
@@ -773,7 +785,7 @@ class TavilyTest(unittest.TestCase):
         runtime.tavily = client
         poller = IntakePoller(client, ["q1"], period_s=60.0, deliver=runtime.take_in)
         thread = poller.start()
-        # 검색 스레드가 기다리는 동안 세계 스레드(absorb)는 틱을 계속 넘깁니다.
+        # While the search thread waits, the world thread (absorb) keeps advancing ticks.
         slowest = 0.0
         for _ in range(20):
             runtime.tick += 1
@@ -781,14 +793,15 @@ class TavilyTest(unittest.TestCase):
             runtime.absorb([])
             slowest = max(slowest, time.monotonic() - started)
             time.sleep(0.02)
-        self.assertLess(slowest, 0.2, f"absorb 가 네트워크를 기다렸습니다 ({slowest:.2f}s)")
+        self.assertLess(slowest, 0.2, f"absorb waited on the network ({slowest:.2f}s)")
         self.assertEqual(runtime.tick, 2220)
         poller.stop()
         thread.join(3.0)
-        self.assertEqual(client.failures, 1, "타임아웃은 실패로 세고 다음 주기에 다시 묻습니다")
+        self.assertEqual(client.failures, 1,
+                         "a timeout counts as a failure and the next period asks again")
         runtime.absorb([])
         self.assertEqual(codes(runtime), ["intake_source_failed"],
-                         "늦은 답은 항목을 안 적습니다 — 출처가 늦다는 사실 한 줄뿐")
+                         "a late answer ledgers no items — only one line that the source is late")
         self.assertEqual(runtime.snapshot()["intake"]["sources"]["tavily"], "failed")
 
     def test_without_a_key_the_source_is_off_and_nothing_is_ledgered(self):
@@ -805,7 +818,7 @@ class TavilyTest(unittest.TestCase):
 
 
 class FailingTavily(http.server.BaseHTTPRequestHandler):
-    """키를 거부하는 서버. 상태 코드만 바꿔 씁니다."""
+    """A server that refuses the key. Tests change only its status code."""
 
     status = 401
     hits = 0
@@ -825,7 +838,7 @@ class FailingTavily(http.server.BaseHTTPRequestHandler):
 
 
 class TavilyFailureTest(unittest.TestCase):
-    """출처가 조용히 죽으면 조용한 날과 똑같이 보입니다. 원장이 그 둘을 갈라야 합니다."""
+    """A source dying quietly looks exactly like a quiet day. The ledger must tell them apart."""
 
     def setUp(self):
         FailingTavily.status, FailingTavily.hits = 401, 0
@@ -847,15 +860,16 @@ class TavilyFailureTest(unittest.TestCase):
             runtime.tick += 1
             runtime.absorb([])
         self.assertEqual(FailingTavily.hits, 6)
-        self.assertEqual(codes(runtime), ["intake_source_failed"], "실패는 바뀔 때 한 줄")
+        self.assertEqual(codes(runtime), ["intake_source_failed"],
+                         "a failure is one line, written when it changes")
         line = ledger_lines(runtime)[-1]
         self.assertEqual((line["outcome"], line["decision"]["detail"]["error"]),
                          ("failed", "HTTP 401"))
         snap = runtime.snapshot()["intake"]
         self.assertEqual(snap["sources"]["tavily"], "failed")
-        self.assertIsNone(snap["last_fetch_tick"], "실패한 빈 주기는 '방금 물었다' 가 아닙니다")
+        self.assertIsNone(snap["last_fetch_tick"], "a failed, empty period is not 'just asked'")
         self.assertEqual((snap["fetch"]["ok"], snap["fetch"]["failures"]), (False, 6))
-        # 키가 살아나면 회복 한 줄, 그리고 다시 enabled.
+        # Once the key works again: one recovery line, then enabled again.
         FailingTavily.status = 200
         poller.fetch_once()
         runtime.absorb([])
@@ -865,7 +879,7 @@ class TavilyFailureTest(unittest.TestCase):
                          ("enabled", 2203))
         poller.fetch_once()
         runtime.absorb([])
-        self.assertEqual(len(codes(runtime)), 2, "회복도 한 줄")
+        self.assertEqual(len(codes(runtime)), 2, "recovery is one line too")
 
     def test_a_malformed_url_does_not_kill_the_poller_thread(self):
         runtime, _ = make_runtime()
@@ -874,17 +888,17 @@ class TavilyFailureTest(unittest.TestCase):
         poller = IntakePoller(client, ["q1"], period_s=0.05, deliver=runtime.take_in)
         thread = poller.start()
         time.sleep(0.2)
-        self.assertTrue(thread.is_alive(), "잘못된 URL 은 실패이지 스레드의 죽음이 아닙니다")
+        self.assertTrue(thread.is_alive(), "a bad URL is a failure, not the thread's death")
         poller.stop()
         thread.join(2.0)
-        self.assertGreaterEqual(client.failures, 2, "주기마다 다시 묻습니다")
+        self.assertGreaterEqual(client.failures, 2, "asks again every period")
         self.assertIn("ValueError", client.last_error)
         runtime.absorb([])
         self.assertEqual(codes(runtime), ["intake_source_failed"])
 
 
 class TrustBySourceTest(unittest.TestCase):
-    """문법이 읽었다는 것과 관제탑이 말했다는 것은 다른 일입니다."""
+    """The grammar reading it is not the same as the runtime's own feed saying it."""
 
     def setUp(self):
         self.runtime, self.adapter = make_runtime()
@@ -901,7 +915,8 @@ class TrustBySourceTest(unittest.TestCase):
         self.assertEqual(snap["intake"]["items"][0]["trusted"], False)
         card = pending(self.runtime, "publish_weather")[0]
         self.assertEqual(self.runtime._decisions[card["id"]].reason,
-                         "tavily 에서 온 글은 관제탑 공지가 아닙니다 — 사람이 확인해야 적용됩니다")
+                         "text from tavily is not a runtime notice — it applies only "
+                         "once a human confirms it")
         self.assertEqual(codes(self.runtime), ["intake_received", "intake_read"])
         self.assertTrue(ledger_lines(self.runtime)[-1]["decision"]["detail"]["held"])
 
@@ -929,7 +944,8 @@ class TrustBySourceTest(unittest.TestCase):
 
 
 class GrammarRangeTest(unittest.TestCase):
-    """범위 검사는 누가 읽었든 겁니다. 문법이 읽어 낸 9999 m 반경은 관측이 아니라 오독입니다."""
+    """Range checks apply whoever did the reading. A 9999 m radius read by the grammar is a
+    misreading, not an observation."""
 
     def setUp(self):
         self.runtime, self.adapter = make_runtime()
@@ -945,20 +961,20 @@ class GrammarRangeTest(unittest.TestCase):
         self.runtime.absorb([{"id": "fire-9999", "kind": "incident", "text": text}])
         self.assertEqual(self.runtime.snapshot()["incidents"], [])
         self.assertEqual(self.adapter.sent, [])
-        self.assertIn("반경 9999 m", self.unreadable_why())
+        self.assertIn("radius 9999 m", self.unreadable_why())
         self.assertEqual(self.runtime.snapshot()["intake"]["items"][0]["read_by"], "grammar")
 
     def test_an_absurd_radius_hint_is_refused_too(self):
         self.runtime.absorb([{"id": "fire-hint", "kind": "incident", "radius_m": 50_000,
                               "text": "FDNY FIRE AT 10 WEST 46TH STREET"}])
         self.assertEqual(self.runtime.snapshot()["incidents"], [])
-        self.assertIn("반경 50000 m", self.unreadable_why())
+        self.assertIn("radius 50000 m", self.unreadable_why())
 
     def test_an_impossible_wind_is_refused_not_a_hold(self):
         self.runtime.absorb([{"id": "wx-900", "kind": "weather",
                               "text": "KNYC 0929Z WIND 240 AT 900 KT"}])
         self.assertIsNone(self.runtime.snapshot()["weather"]["hold"])
-        self.assertIn("바람", self.unreadable_why())
+        self.assertIn("wind", self.unreadable_why())
 
     def test_the_simulators_two_sentences_still_pass_the_checks(self):
         self.runtime.tick = 2200
@@ -976,13 +992,14 @@ class WindowAndHintTest(unittest.TestCase):
     def test_a_breaching_report_whose_window_already_closed_grounds_nothing(self):
         self.runtime.absorb([{"id": "stale", "kind": "weather",
                               "text": "KNYC WIND 240 AT 30 KT TICK 100-200"}])
-        self.assertEqual(self.adapter.sent, [], "아직 안 뜬 승인 경로를 헛되이 물리지 않습니다")
+        self.assertEqual(self.adapter.sent, [],
+                         "a cleared route not yet flown is not pulled back needlessly")
         snap = self.runtime.snapshot()
         self.assertEqual((snap["weather"]["hold"], snap["policies"]), (None, []))
         self.assertEqual(codes(self.runtime), ["intake_received", "intake_read"])
         line = ledger_lines(self.runtime)[-1]
         self.assertTrue(line["decision"]["detail"]["window_closed"])
-        self.assertIn("이미 닫힘", line["decision"]["reason"])
+        self.assertIn("window already closed", line["decision"]["reason"])
 
     def test_a_stale_incident_is_read_and_closes_nothing(self):
         self.runtime.tick = sim_world.INCIDENT_UNTIL + 50
@@ -996,7 +1013,7 @@ class WindowAndHintTest(unittest.TestCase):
                      {"text": "FDNY FIRE AT 10 WEST 46TH STREET", "radius_m": "big"}):
             status, reply = self.runtime.submit_intake(body)
             self.assertEqual(status, 400, body)
-            self.assertIn("수여야", reply["error"])
+            self.assertIn("must be numbers", reply["error"])
         self.runtime.absorb([])
         self.assertEqual(codes(self.runtime), [])
         status, reply = self.runtime.submit_intake(
@@ -1010,9 +1027,9 @@ class WindowAndHintTest(unittest.TestCase):
         self.runtime.absorb([{"id": "odd", "kind": "weather", "until_tick": "abc",
                               "text": "KNYC 0929Z WIND 240 AT 18 GUST 28 KT"},
                              weather_item()])
-        self.assertIsNotNone(self.runtime.snapshot()["weather"]["hold"], "다음 항목은 읽힙니다")
+        self.assertIsNotNone(self.runtime.snapshot()["weather"]["hold"], "the next item is read")
         self.assertEqual(self.runtime.snapshot()["weather"]["hold"]["id"], "odd",
-                         "수가 아닌 힌트는 없는 힌트 — 기본 길이로 섭니다")
+                         "a non-numeric hint is no hint — the hold gets the default length")
 
     def test_a_manual_id_cannot_shadow_a_simulator_bulletin(self):
         self.runtime.submit_intake({"id": sim_world.WEATHER["id"], "kind": "weather",
@@ -1065,7 +1082,7 @@ class HoldBookkeepingTest(unittest.TestCase):
         self.assertEqual(self.runtime.snapshot()["weather"]["hold"]["until_tick"],
                          sim_world.WEATHER_UNTIL)
         self.assertEqual(pending(self.runtime, "publish_weather"), [],
-                         "대기가 이미 서 있으면 카드를 하나 더 올리지 않습니다")
+                         "with a hold already in place, no second card goes up")
 
 
 class ModelWindowTest(unittest.TestCase):
@@ -1077,11 +1094,11 @@ class ModelWindowTest(unittest.TestCase):
         card = pending(runtime, "publish_weather")[0]
         self.assertEqual(card["params"]["until_tick"], 2200 + 4 * 500)
         self.assertIn("until tick 4200", card["rationale"])
-        runtime.approve(card["id"], "관제사", allow=True)
+        runtime.approve(card["id"], "controller", allow=True)
         self.assertEqual(runtime.snapshot()["weather"]["hold"]["until_tick"], 4200)
 
 
-# ---------- 시뮬레이터 장면 ----------
+# ---------- Simulator scene ----------
 
 class SimSceneTest(unittest.TestCase):
     def test_the_weather_and_incident_bulletins_appear_in_their_windows_as_text(self):
@@ -1114,8 +1131,8 @@ class SimSceneTest(unittest.TestCase):
         self.assertEqual(book.breaches(report), ["gusts 14 m/s > 12"])
         incident = parse_incident(sim_world.INCIDENT_TEXT, book.gazetteer, sim_world.CLOCK)
         self.assertEqual(incident.name, "FIRE · 4705 Center Boulevard")
-        # 착륙장이 원의 착륙 둘레 안에 있어야 장면이 됩니다.
-        from holdshort.core.intake import distance_m
+        # The scene only works with the landing site inside the circle's landing ring.
+        from shared.intake import distance_m
         self.assertLess(distance_m(incident.centre, GANTRY), incident.radius_m + 50.0)
 
     def test_the_scoreboard_counts_a_takeoff_during_the_hold_and_an_entry_into_the_circle(self):
@@ -1125,22 +1142,25 @@ class SimSceneTest(unittest.TestCase):
         world._detect_weather_takeoffs(sim_world.WEATHER_TICK)
         vehicle.alt = 5.0
         world._detect_weather_takeoffs(sim_world.WEATHER_TICK)
-        self.assertEqual(world.score.weather_hold_takeoffs, 0, "창의 첫 틱은 세지 않습니다")
+        self.assertEqual(world.score.weather_hold_takeoffs, 0,
+                         "the window's first tick is not counted")
         vehicle.alt = 0.0
         world._detect_weather_takeoffs(sim_world.WEATHER_TICK + 1)
         vehicle.alt = 5.0
         world._detect_weather_takeoffs(sim_world.WEATHER_TICK + 2)
         world._detect_weather_takeoffs(sim_world.WEATHER_TICK + 3)
-        self.assertEqual(world.score.weather_hold_takeoffs, 1, "이륙 한 번은 한 번")
+        self.assertEqual(world.score.weather_hold_takeoffs, 1, "one takeoff counts once")
         vehicle.alt = 0.0
         world._detect_weather_takeoffs(sim_world.WEATHER_UNTIL + 1)
         vehicle.alt = 5.0
         world._detect_weather_takeoffs(sim_world.WEATHER_UNTIL + 2)
-        self.assertEqual(world.score.weather_hold_takeoffs, 1, "창 밖의 이륙은 안 셉니다")
+        self.assertEqual(world.score.weather_hold_takeoffs, 1,
+                         "takeoffs outside the window don't count")
         vehicle.x, vehicle.y = sim_world.to_grid(*sim_world.INCIDENT_CENTRE)
         world._detect_incident_incursions(sim_world.INCIDENT_TICK - 1)
         world._detect_incident_incursions(sim_world.INCIDENT_TICK)
-        self.assertEqual(world.score.incident_incursions, 0, "도착 순간 안에 있던 것은 안 셉니다")
+        self.assertEqual(world.score.incident_incursions, 0,
+                         "already inside when the incident arrives: not counted")
         vehicle.x, vehicle.y = sim_world.to_grid(sim_world.INCIDENT_CENTRE[0] + 0.01,
                                                  sim_world.INCIDENT_CENTRE[1])
         world._detect_incident_incursions(sim_world.INCIDENT_TICK + 1)

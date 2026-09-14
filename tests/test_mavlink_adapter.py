@@ -16,13 +16,13 @@ try:
     from pymavlink import mavutil
 
     HAS_PYMAVLINK = True
-except ImportError:  # 기본 설치에는 없습니다. 이 어댑터를 쓸 때만 넣습니다.
+except ImportError:  # Not in the default install. Add it only to use this adapter.
     HAS_PYMAVLINK = False
 
 def next_port() -> int:
-    """운영체제가 비어 있다고 주는 UDP 포트. 시험마다 새 포트입니다.
+    """A UDP port the OS reports as free. Every test gets a new one.
 
-    고정 범위(14599~)를 쓰던 때는 같은 기계에서 시험을 둘 돌리면 서로의 포트를 잡았습니다.
+    With a fixed range (14599~), two test runs on one machine grabbed each other's ports.
     """
     with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as probe:
         probe.bind(("127.0.0.1", 0))
@@ -39,10 +39,11 @@ def wait_until(condition, timeout_s: float = 5.0, step_s: float = 0.02) -> bool:
 
 
 class AutopilotStub:
-    """PX4 처럼 답하는 자동조종 흉내.
+    """A fake autopilot that answers the way PX4 does.
 
-    하트비트·위치·배터리를 흘리고, 명령(COMMAND_LONG)과 임무 올리기(MISSION_*)에 답합니다.
-    받은 것을 순서대로 적어 두어 '무엇을 언제 보냈나' 를 시험이 확인할 수 있게 합니다.
+    Streams heartbeat, position and battery, and answers commands (COMMAND_LONG) and mission
+    uploads (MISSION_*). Records everything it receives, in order, so a test can check what
+    was sent and when.
     """
 
     def __init__(self, port: int, refuse: bool = False, refuse_commands=(),
@@ -50,19 +51,19 @@ class AutopilotStub:
                  rerequest: bool = False):
         self.link = mavutil.mavlink_connection(f"udpout:127.0.0.1:{port}", source_system=1,
                                                source_component=1)
-        self.refuse = refuse                        # 모든 명령을 거절
-        self.refuse_commands = set(refuse_commands)  # 이 명령만 거절 (예: 시동)
-        self.refuse_mission = refuse_mission        # 임무를 끝까지 받고 오류로 답함
-        self.silent = silent                        # 하트비트만 흘리고 아무것에도 답하지 않음
-        self.rerequest = rerequest                  # 항목을 받아도 늘 0번을 다시 달라고 함(고장)
+        self.refuse = refuse                        # refuse every command
+        self.refuse_commands = set(refuse_commands)  # refuse only these (e.g. arming)
+        self.refuse_mission = refuse_mission        # take every item, then answer with an error
+        self.silent = silent                        # stream heartbeats only; answer nothing
+        self.rerequest = rerequest                  # re-request item 0 every time (broken)
         self.armed = airborne
         self.alt_m = 60.0 if airborne else 0.0
         self.custom_mode = 0
-        self.received: list[int] = []               # 받은 COMMAND_LONG 의 command, 순서대로
-        self.commands: list = []                    # 받은 COMMAND_LONG 전체
-        self.missions: list[list] = []              # 끝까지 올라온 임무(MISSION_ITEM_INT 목록)
+        self.received: list[int] = []               # each COMMAND_LONG's command, in order
+        self.commands: list = []                    # every COMMAND_LONG received
+        self.missions: list[list] = []              # completed uploads (MISSION_ITEM_INT lists)
         self.cleared = 0
-        self.traffic: list[str] = []                # 하트비트 말고 받은 메시지 종류, 순서대로
+        self.traffic: list[str] = []                # types of non-heartbeat messages, in order
         self.error: BaseException | None = None
         self.running = True
         self._upload: dict | None = None
@@ -80,7 +81,7 @@ class AutopilotStub:
     def _run(self):
         try:
             self._loop()
-        except BaseException as exc:  # noqa: BLE001 - 스텁이 조용히 죽으면 진단이 안 됩니다
+        except BaseException as exc:  # noqa: BLE001 - a stub dying silently cannot be diagnosed
             self.error = exc
 
     def _loop(self):
@@ -148,7 +149,7 @@ class AutopilotStub:
             return
         upload = self._upload
         if upload is None or message.seq != len(upload["items"]):
-            return  # 순서 밖의 항목. 자동조종은 같은 번호를 다시 요청합니다
+            return  # out-of-order item; the autopilot asks for that number again
         upload["items"].append(message)
         if len(upload["items"]) < upload["count"]:
             self._request(len(upload["items"]))
@@ -173,10 +174,10 @@ LEGS = [{"lat": 40.701803, "lon": -73.970437, "alt_m": 70.0},
 
 
 class RouteItemsTest(unittest.TestCase):
-    """경로 → 임무 항목. 네트워크가 필요 없는 부분이라 pymavlink 없이도 돕니다."""
+    """Route → mission items. No network involved, so this runs without pymavlink."""
 
     def test_a_grounded_aircraft_takes_off_where_it_stands(self):
-        from holdshort.adapters.mavlink_fleet import route_items
+        from backend.adapters.mavlink_fleet import route_items
 
         items = route_items(LEGS, airborne=False)
         self.assertEqual([item["command"] for item in items],
@@ -186,36 +187,36 @@ class RouteItemsTest(unittest.TestCase):
         self.assertEqual((items[-1]["lat"], items[-1]["lon"]), (LEGS[-1]["lat"], LEGS[-1]["lon"]))
 
     def test_an_airborne_aircraft_flies_the_first_leg_too(self):
-        from holdshort.adapters.mavlink_fleet import route_items
+        from backend.adapters.mavlink_fleet import route_items
 
         items = route_items(LEGS, airborne=True)
         self.assertEqual([item["command"] for item in items],
                          ["waypoint", "waypoint", "waypoint", "land"])
 
     def test_half_a_route_is_no_mission(self):
-        from holdshort.adapters.mavlink_fleet import route_items
+        from backend.adapters.mavlink_fleet import route_items
 
         self.assertEqual(route_items([LEGS[0]], airborne=False), [])
 
     def test_the_exit_mission_is_the_way_out_and_a_landing(self):
-        from holdshort.adapters.mavlink_fleet import exit_items
+        from backend.adapters.mavlink_fleet import exit_items
 
         items = exit_items({"lat": 40.705, "lon": -73.975}, 55.0)
         self.assertEqual([item["command"] for item in items], ["waypoint", "land"])
         self.assertEqual(items[0]["alt_m"], 55.0)
 
     def test_px4_mode_names_come_from_the_heartbeat(self):
-        from holdshort.adapters.mavlink_fleet import px4_mode_name
+        from backend.adapters.mavlink_fleet import px4_mode_name
 
         self.assertEqual(px4_mode_name((4 << 16) | (4 << 24)), "AUTO.MISSION")
         self.assertEqual(px4_mode_name((4 << 16) | (6 << 24)), "AUTO.LAND")
         self.assertEqual(px4_mode_name(3 << 16), "POSCTL")
 
 
-@unittest.skipUnless(HAS_PYMAVLINK, "pymavlink 미설치 (pip install pymavlink)")
+@unittest.skipUnless(HAS_PYMAVLINK, "pymavlink not installed (pip install pymavlink)")
 class MavlinkAdapterTest(unittest.TestCase):
     def _adapter(self, **stub_options):
-        from holdshort.adapters.mavlink_fleet import MavlinkFleetAdapter
+        from backend.adapters.mavlink_fleet import MavlinkFleetAdapter
 
         port = next_port()
         stub = AutopilotStub(port, **stub_options).start()
@@ -228,15 +229,15 @@ class MavlinkAdapterTest(unittest.TestCase):
 
     def _check_stub(self, stub):
         if stub.error is not None:
-            raise AssertionError(f"자동조종 스텁이 죽었습니다: {stub.error!r}")
+            raise AssertionError(f"the autopilot stub died: {stub.error!r}")
 
     def test_telemetry_comes_from_the_autopilot(self):
         adapter, stub = self._adapter()
         entry = {}
 
         def battery_and_position_seen():
-            # 배터리와 위치는 같은 박동에 오지만 따로 흡수됩니다. 배터리만 보고 멈추면 부하가 걸린
-            # 기계에서 위치가 아직 없었습니다.
+            # Battery and position arrive on the same beat but are absorbed separately. Stopping
+            # at the battery alone found no position yet on a loaded machine.
             nonlocal entry
             entry = adapter.telemetry()["assets"]["drone-02"]
             return entry.get("battery") == 41.0 and entry.get("lat") is not None
@@ -277,20 +278,21 @@ class MavlinkAdapterTest(unittest.TestCase):
                           mavutil.mavlink.MAV_CMD_NAV_WAYPOINT,
                           mavutil.mavlink.MAV_CMD_NAV_WAYPOINT,
                           mavutil.mavlink.MAV_CMD_NAV_LAND])
-        # 판정된 구간의 고도와 좌표 그대로. 어댑터가 경로를 다시 그리지 않는다는 뜻입니다.
+        # The judged legs' altitudes and coordinates, unchanged. That is, the adapter does not
+        # redraw the route.
         for item, leg in zip(items, LEGS, strict=False):
             self.assertEqual(item.frame, mavutil.mavlink.MAV_FRAME_GLOBAL_RELATIVE_ALT)
             self.assertEqual(item.x, round(leg["lat"] * 1e7))
             self.assertEqual(item.y, round(leg["lon"] * 1e7))
             self.assertAlmostEqual(item.z, leg["alt_m"], places=3)
         self.assertEqual(items[-1].x, round(LEGS[-1]["lat"] * 1e7))
-        # 임무를 다 올린 뒤에야 모드·시동·시작입니다.
+        # Mode, arm and start come only after the whole mission is up.
         self.assertEqual(stub.received, [mavutil.mavlink.MAV_CMD_DO_SET_MODE,
                                          mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM,
                                          mavutil.mavlink.MAV_CMD_MISSION_START])
         mode = stub.commands[0]
         self.assertEqual((int(mode.param2), int(mode.param3)), (4, 4))  # AUTO.MISSION
-        self.assertEqual(int(stub.commands[1].param1), 1)               # 시동 걸기
+        self.assertEqual(int(stub.commands[1].param1), 1)               # arm
 
     def test_departure_sends_the_autopilot_nothing(self):
         adapter, stub = self._adapter()
@@ -311,8 +313,8 @@ class MavlinkAdapterTest(unittest.TestCase):
         self.assertEqual([item.command for item in items],
                          [mavutil.mavlink.MAV_CMD_NAV_WAYPOINT, mavutil.mavlink.MAV_CMD_NAV_LAND])
         self.assertEqual(items[0].x, round(40.705 * 1e7))
-        self.assertAlmostEqual(items[0].z, 60.0, places=1)   # 지금 고도로 나갑니다
-        # 이미 떠 있으니 시동은 다시 걸지 않습니다.
+        self.assertAlmostEqual(items[0].z, 60.0, places=1)   # leaves at its current altitude
+        # Already airborne, so it is not armed again.
         self.assertNotIn(mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM, stub.received)
         self.assertIn(mavutil.mavlink.MAV_CMD_MISSION_START, stub.received)
 
@@ -347,12 +349,13 @@ class MavlinkAdapterTest(unittest.TestCase):
         spent = time.monotonic() - started
         self.assertFalse(result["ok"], result)
         self.assertIn("never asked", result["error"])
-        self.assertLess(spent, 10.0, "응답 없는 자동조종을 영영 기다렸습니다")
+        self.assertLess(spent, 10.0, "waited forever on a silent autopilot")
         self.assertEqual(stub.received, [])
 
     def test_an_autopilot_that_keeps_asking_for_one_item_is_given_up_on(self):
-        """같은 항목만 끝없이 다시 달라는 자동조종. 올리기에 끝이 없으면 거울의 작업 스레드가
-        거기 붙잡혀 뒤에 줄 선 회수가 안 나갑니다(실측: 25초에 항목 1,866개, 회수 미전송)."""
+        """An autopilot that asks for the same item again and again. An upload that never ends
+        holds the mirror's worker thread there, and the recall queued behind it never goes out
+        (measured: 1,866 items in 25 s, recall never sent)."""
         adapter, stub = self._adapter(rerequest=True)
         self.assertTrue(wait_until(lambda: adapter.link_up("drone-02"), 8))
         started = time.monotonic()
@@ -360,7 +363,7 @@ class MavlinkAdapterTest(unittest.TestCase):
         self.assertFalse(result["ok"], result)
         self.assertIn("kept asking for mission item 0", result["error"])
         self.assertLess(time.monotonic() - started, 5.0)
-        self.assertEqual(stub.received, [], "올리지 못한 임무로 시동을 걸지 않습니다")
+        self.assertEqual(stub.received, [], "never arms on a mission that failed to upload")
         self._check_stub(stub)
 
 

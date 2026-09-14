@@ -8,9 +8,9 @@ not filing what its own aircraft cannot do.
 
 import unittest
 
-from holdshort.agent.detect import Concern, detect
-from holdshort.agent.propose import ALLOWED_ACTIONS, Proposer, possible_now
-from holdshort.llm.client import LlmReply, TieredLlm
+from drone.agent.detect import Concern, detect
+from drone.agent.propose import ALLOWED_ACTIONS, Proposer, possible_now
+from shared.llm.client import LlmReply, TieredLlm
 
 
 class ScriptedLlm(TieredLlm):
@@ -27,7 +27,7 @@ class ScriptedLlm(TieredLlm):
 
 READY = {"id": "drone-02", "model": "dv-x500", "state": "ready", "battery": 56.0, "alt_m": 0.8,
          "vibration": 0.1, "autonomy_health": 1.0, "passengers": 0, "cargo": 0}
-RELOAD = Concern(kind="needs_reload", urgency="normal", detail="배터리 56%, 다음 짐을 싣습니다")
+RELOAD = Concern(kind="needs_reload", urgency="normal", detail="battery 56%, loading the next job")
 
 
 class ImpossibleFormTest(unittest.TestCase):
@@ -37,7 +37,7 @@ class ImpossibleFormTest(unittest.TestCase):
         llm = ScriptedLlm('{"action": "charge", "pad": null, "rationale": "Battery is low."}')
         written = Proposer(llm).write(RELOAD, READY, "pad:launch", frozenset(), ("pad:launch",))
         self.assertEqual((written.action, written.author), ("depart", "rules"))
-        self.assertEqual(llm.stats["nano"].fallback, 1, "버린 답은 규칙이 대신한 것으로 셉니다")
+        self.assertEqual(llm.stats["nano"].fallback, 1, "a discarded answer counts as a fallback")
 
     def test_an_aircraft_on_a_landing_area_asks_for_its_next_route_not_a_charge(self):
         landed = {**READY, "state": "landed", "alt_m": 0.0, "battery": 18.0, "job": "Union Square",
@@ -45,14 +45,14 @@ class ImpossibleFormTest(unittest.TestCase):
         concern = detect(landed)
         self.assertEqual(concern.kind, "needs_route")
         no_job = {**landed, "job": None}
-        self.assertIsNone(detect(no_job), "갈 곳이 없으면 착륙장에서는 아무것도 신청하지 않습니다")
+        self.assertIsNone(detect(no_job), "on a landing site with nowhere to go, it files nothing")
 
     def test_a_bay_reservation_is_only_for_a_fault(self):
         llm = ScriptedLlm('{"action": "reserve_pad", "pad": "pad:launch", '
                           '"rationale": "Park now."}')
         written = Proposer(llm).write(RELOAD, READY, "pad:launch", frozenset(), ("pad:launch",))
         self.assertEqual((written.action, written.author), ("depart", "rules"))
-        fault = Concern(kind="motor_fault", urgency="high", detail="모터 진동 0.9")
+        fault = Concern(kind="motor_fault", urgency="high", detail="motor vibration 0.9")
         written = Proposer(llm).write(fault, READY, "pad:launch", frozenset(), ("pad:launch",))
         self.assertEqual((written.action, written.author), ("reserve_pad", "scripted-nano"))
 

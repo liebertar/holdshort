@@ -17,7 +17,7 @@
     "base_url": "https://tfr.faa.gov/",
     "results": [
      {
-      "url": "https://tfr.faa.gov/tfr3/?page=detail_6_0922#holdshort-fixture",
+      "url": "https://tfr.faa.gov/tfr3/?page=detail_6_0922#skynet-fixture",
       "title": "FDC 6/0922 NEW YORK, NY - VIP",
       "raw_content": "FDC 6/0922 (fixture) - TEMPORARY FLIGHT RESTRICTION. Location: NEW YORK, NY. Beginning Date and Time: September 21, 2026 at 1000 UTC. Ending Date and Time: September 26, 2026 at 0400 UTC. Reason for NOTAM: Temporary flight restrictions for VIP movement during the United Nations General Assembly high-level week. Type: VIP. Airspace Definition: Center: 404528N0735830W (Latitude: 40.7578, Longitude: -73.9750). Radius: 1 nautical miles. Altitude: From the surface up to and including 3000 feet MSL. Operating restrictions: Unmanned aircraft (UAS) operations are prohibited within the TFR unless authorized by the FAA System Operations Support Center."
      }
@@ -41,7 +41,7 @@
     "results": [
      {
       "title": "FDC 6/0922 - New York, NY - VIP movement (UN General Assembly)",
-      "url": "https://tfr.faa.gov/tfr3/?page=detail_6_0922#holdshort-fixture",
+      "url": "https://tfr.faa.gov/tfr3/?page=detail_6_0922#skynet-fixture",
       "score": 0.91,
       "content": "Temporary flight restrictions for VIP movement during the United Nations General Assembly high-level week. UAS operations are prohibited within 1 nautical mile of Midtown East."
      }
@@ -53,7 +53,7 @@
    "response": {
     "results": [
      {
-      "url": "https://tfr.faa.gov/tfr3/?page=detail_6_0922#holdshort-fixture",
+      "url": "https://tfr.faa.gov/tfr3/?page=detail_6_0922#skynet-fixture",
       "raw_content": "FDC 6/0922 (fixture) - TEMPORARY FLIGHT RESTRICTION. Location: NEW YORK, NY. Beginning Date and Time: September 21, 2026 at 1000 UTC. Ending Date and Time: September 26, 2026 at 0400 UTC. Reason for NOTAM: Temporary flight restrictions for VIP movement during the United Nations General Assembly high-level week. Type: VIP. Airspace Definition: Center: 404528N0735830W (Latitude: 40.7578, Longitude: -73.9750). Radius: 1 nautical miles. Altitude: From the surface up to and including 3000 feet MSL. Operating restrictions: Unmanned aircraft (UAS) operations are prohibited within the TFR unless authorized by the FAA System Operations Support Center."
      }
     ]

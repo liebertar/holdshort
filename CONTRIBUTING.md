@@ -56,4 +56,4 @@ CI (`.github/workflows/checks.yml`) runs the same on every pull request into `de
 - The runtime alone judges and commands. Models write forms, pick among legal candidates and read prose;
   they never decide a clearance.
 - Rules that tighten apply at once; rules that loosen wait for a person or an expiry.
-- Comments and docs are in English; the README also comes in Korean.
+- Comments and docs are in English; the README also comes in Korean, Chinese and Spanish.

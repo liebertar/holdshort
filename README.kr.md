@@ -2,7 +2,7 @@
 
 **에이전트는 신청하고, 런타임이 허가한다. 허가받은 비행만 움직인다.**
 
-[English](README.md)
+[English](README.md) · [中文](README.cn.md) · [Español](README.es.md)
 
 - AI가 운용하는 드론 기단을 위한 비행 허가 런타임.
 - 드론 에이전트(Nemotron 또는 규칙)는 신청만 한다. 판정·기록·명령은 런타임이 맡는다.
